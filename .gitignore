@@ -1,0 +1,29 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/.npm-cache/
+dist/
+
+# Data (user-specific, regenerated at runtime)
+backend/data/resume_tender.db
+backend/data/chroma_store/
+backend/data/uploads/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude
+.claude/

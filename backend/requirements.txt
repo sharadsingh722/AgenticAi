@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy
+pydantic
+pydantic-settings
+python-dotenv
+pdfplumber
+chromadb
+tenacity
+aiofiles
+openai
+PyMuPDF
+langgraph
+langchain
+langchain-openai
+langchain-community
