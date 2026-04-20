@@ -659,12 +659,32 @@ def get_match_results(tender_id: int, role_title: Optional[str] = None) -> str:
         for match in matches:
             resume = db.query(Resume).filter(Resume.id == match.resume_id).first()
             name = resume.name if resume else "Unknown"
+            photo_url = f"/api/resumes/photo/{resume.photo_filename}" if resume and resume.photo_filename else ""
+            designation = "N/A"
+            experience_years = resume.total_years_experience if resume else 0
+            if resume and resume.parsed_data:
+                try:
+                    parsed = json.loads(resume.parsed_data)
+                    exp = parsed.get("experience", [])
+                    designation = exp[0].get("role", "N/A") if exp else "N/A"
+                except Exception:
+                    designation = "N/A"
             explanation = match.llm_explanation or "No explanation available."
             strengths = json.loads(match.strengths) if match.strengths else []
+            try:
+                breakdown = json.loads(match.score_breakdown) if match.score_breakdown else {}
+            except Exception:
+                breakdown = {}
             
             # Use a more explicit single-line format for high visibility
             summary = (
-                f"- Candidate: {name} | Role: {match.role_title} | Fit Score: {match.final_score:.1f}% | "
+                f"- Candidate: {name} | Resume ID: {match.resume_id} | Role: {match.role_title} | "
+                f"Designation: {designation} | Experience: {experience_years:g} yrs | "
+                f"Photo URL: {photo_url} | Fit Score: {match.final_score:.1f}% | "
+                f"Structured Score: {(match.structured_score or 0):.1f} | AI Score: {(match.llm_score or 0):.1f} | "
+                f"Skills: {breakdown.get('skills', 0)} | Domain: {breakdown.get('domain', 0)} | "
+                f"Edu: {breakdown.get('education', 0)} | Certs: {breakdown.get('certifications', 0)} | "
+                f"Exp: {breakdown.get('experience', 0)} | "
                 f"WHY BEST FIT: {explanation}"
             )
             if strengths:

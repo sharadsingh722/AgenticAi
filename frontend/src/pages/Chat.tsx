@@ -9,16 +9,490 @@ import {
   Command,
   Zap,
   ShieldCheck,
-  Terminal
+  Terminal,
+  ChevronDown
 } from 'lucide-react';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import { cn } from '../utils/utils';
+import { getResume, listResumes } from '../api/client';
+import type { Resume } from '../types';
 
 interface ChatMsg {
   role: 'user' | 'assistant' | 'tool';
   content: string;
   thought?: string;
   toolCalls?: { tool: string; input?: any; result?: string; expanded?: boolean }[];
+}
+
+interface ParsedMatchCard {
+  candidateName: string;
+  resumeId?: number;
+  roleTitle: string;
+  designation?: string;
+  experienceYears?: string;
+  photoUrl?: string;
+  fitScore: number;
+  structuredScore?: number;
+  aiScore?: number;
+  explanation?: string;
+  strengths: string[];
+  breakdown: {
+    skills?: number;
+    domain?: number;
+    edu?: number;
+    certs?: number;
+    exp?: number;
+  };
+}
+
+interface ParsedResumeCard {
+  candidateName: string;
+  resumeId?: number;
+  role?: string;
+  experience?: string;
+  education?: string;
+  skills: string[];
+  relevance?: string;
+}
+
+let resumeListCache: Promise<Resume[]> | null = null;
+
+function gradeColor(pct: number) {
+  if (pct >= 75) return { bg: 'bg-emerald-50/60', text: 'text-emerald-700', border: 'border-emerald-200/50' };
+  if (pct >= 50) return { bg: 'bg-amber-50/60', text: 'text-amber-700', border: 'border-amber-200/50' };
+  if (pct >= 25) return { bg: 'bg-orange-50/60', text: 'text-orange-700', border: 'border-orange-200/50' };
+  return { bg: 'bg-rose-50/60', text: 'text-rose-700', border: 'border-rose-200/50' };
+}
+
+function normalizeCandidateName(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function getCachedResumes() {
+  if (!resumeListCache) {
+    resumeListCache = listResumes().catch((error) => {
+      resumeListCache = null;
+      throw error;
+    });
+  }
+  return resumeListCache;
+}
+
+function compactScore(value?: number) {
+  if (value === undefined || Number.isNaN(value)) return '0';
+  return Number(value).toFixed(0);
+}
+
+function parseFields(line: string) {
+  const fields: Record<string, string> = {};
+  const cleaned = line.replace(/^[-*]\s*/, '').trim();
+  const parts = cleaned.split(/\s+\|\s+/);
+  for (const part of parts) {
+    const idx = part.indexOf(':');
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim().toLowerCase();
+    const value = part.slice(idx + 1).trim();
+    fields[key] = value;
+  }
+  return fields;
+}
+
+function parseMatchCards(result?: string): ParsedMatchCard[] {
+  if (!result || !result.includes('Candidate:') || !result.includes('Fit Score:')) return [];
+
+  return result
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.includes('Candidate:') && line.includes('Fit Score:'))
+    .map((line): ParsedMatchCard => {
+      const fields = parseFields(line);
+      const fitScore = Number((fields['fit score'] || '0').replace('%', ''));
+      const strengths = (fields['top strengths'] || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+      return {
+        candidateName: fields.candidate || 'Unknown Candidate',
+        resumeId: fields['resume id'] ? Number(fields['resume id']) : undefined,
+        roleTitle: fields.role || 'Candidate Match',
+        designation: fields.designation,
+        experienceYears: fields.experience,
+        photoUrl: fields['photo url'],
+        fitScore,
+        structuredScore: fields['structured score'] ? Number(fields['structured score']) : undefined,
+        aiScore: fields['ai score'] ? Number(fields['ai score']) : undefined,
+        explanation: fields['why best fit'],
+        strengths,
+        breakdown: {
+          skills: fields.skills ? Number(fields.skills) : undefined,
+          domain: fields.domain ? Number(fields.domain) : undefined,
+          edu: fields.edu ? Number(fields.edu) : undefined,
+          certs: fields.certs ? Number(fields.certs) : undefined,
+          exp: fields.exp ? Number(fields.exp) : undefined,
+        },
+      };
+    })
+    .filter((item) => item.candidateName !== 'Unknown Candidate');
+}
+
+function getMatchCardsFromMessage(msg: ChatMsg) {
+  const cards: ParsedMatchCard[] = [];
+  msg.toolCalls
+    ?.filter((tc) => tc.tool === 'get_match_results')
+    .forEach((tc) => cards.push(...parseMatchCards(tc.result)));
+
+  if (cards.length === 0) {
+    cards.push(...parseMatchCards(msg.content));
+  }
+
+  const seen = new Set<string>();
+  return cards.filter((card) => {
+    const key = `${card.resumeId || card.candidateName}-${card.roleTitle}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function parseResumeCardsFromToolResult(result?: string): ParsedResumeCard[] {
+  if (!result) return [];
+
+  return result
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('- ') && line.includes('(ID:') && line.includes(' | '))
+    .map((line): ParsedResumeCard | null => {
+      const nameMatch = line.match(/^-\s+\*\*(.*?)\*\*\s+\(ID:(\d+)\)\s+\|\s+(.+)$/) || line.match(/^-\s+(.*?)\s+\(ID:(\d+)\)\s+\|\s+(.+)$/);
+      if (!nameMatch) return null;
+
+      const [, rawName, rawId, rest] = nameMatch;
+      const parts = rest.split(/\s+\|\s+/);
+      const fields = parseFields(`- ${parts.slice(2).join(' | ')}`);
+      const skillsText = fields.skills || '';
+      const skills = skillsText
+        .split(',')
+        .map((skill) => skill.trim())
+        .filter(Boolean)
+        .slice(0, 8);
+
+      return {
+        candidateName: rawName.trim(),
+        resumeId: Number(rawId),
+        role: parts[0]?.trim(),
+        experience: parts[1]?.trim(),
+        education: fields.education,
+        skills,
+        relevance: fields.relevance,
+      };
+    })
+    .filter((item): item is ParsedResumeCard => item !== null);
+}
+
+function parseResumeCardsFromContent(content?: string): ParsedResumeCard[] {
+  if (!content || !content.includes('**')) return [];
+
+  const cards: ParsedResumeCard[] = [];
+  let current: ParsedResumeCard | null = null;
+
+  for (const line of content.split('\n')) {
+    const candidateMatch = line.match(/^\s*[-*]\s+\*\*(.+?)\*\*\s*$/);
+    if (candidateMatch) {
+      current = { candidateName: candidateMatch[1].trim(), skills: [] };
+      cards.push(current);
+      continue;
+    }
+
+    if (!current) continue;
+
+    const fieldMatch = line.match(/^\s*[-*]\s+\*\*(Role|Experience|Education|Skills):\*\*\s*(.+)$/i);
+    if (!fieldMatch) continue;
+
+    const key = fieldMatch[1].toLowerCase();
+    const value = fieldMatch[2].trim();
+    if (key === 'role') current.role = value;
+    if (key === 'experience') current.experience = value;
+    if (key === 'education') current.education = value;
+    if (key === 'skills') {
+      current.skills = value
+        .split(',')
+        .map((skill) => skill.trim())
+        .filter(Boolean)
+        .slice(0, 8);
+    }
+  }
+
+  return cards;
+}
+
+function getResumeCardsFromMessage(msg: ChatMsg) {
+  const cards: ParsedResumeCard[] = [];
+  msg.toolCalls
+    ?.filter((tc) => tc.tool === 'sql_query_resumes' || tc.tool === 'search_resumes')
+    .forEach((tc) => cards.push(...parseResumeCardsFromToolResult(tc.result)));
+
+  if (cards.length === 0) {
+    cards.push(...parseResumeCardsFromContent(msg.content));
+  }
+
+  const seen = new Set<string>();
+  return cards.filter((card) => {
+    const key = `${card.resumeId || normalizeCandidateName(card.candidateName)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function MiniBadge({ label, value, max }: { label: string; value?: number; max: number }) {
+  const pct = max > 0 ? ((value || 0) / max) * 100 : 0;
+  const color = gradeColor(pct);
+  return (
+    <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider ${color.bg} ${color.text} border ${color.border}`}>
+      {label}: <span className="text-slate-900">{compactScore(value)}</span>
+      <span className="text-slate-300 font-medium">/ {max}</span>
+    </span>
+  );
+}
+
+function CandidatePhoto({ candidateName, resumeId, photoUrl, className }: { candidateName: string; resumeId?: number; photoUrl?: string; className: string }) {
+  const [resolvedPhotoUrl, setResolvedPhotoUrl] = useState(() => {
+    const url = photoUrl?.trim();
+    return url && url.toLowerCase() !== 'n/a' ? url : '';
+  });
+  const initials = candidateName
+    .split(' ')
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 2);
+
+  useEffect(() => {
+    if (resolvedPhotoUrl) return;
+
+    let cancelled = false;
+
+    async function resolvePhoto() {
+      try {
+        if (resumeId) {
+          const detail = await getResume(resumeId);
+          if (!cancelled && detail.photo_url) {
+            setResolvedPhotoUrl(detail.photo_url);
+            return;
+          }
+        }
+
+        const resumes = await getCachedResumes();
+        const targetName = normalizeCandidateName(candidateName);
+        const match = resumes.find((resume) => normalizeCandidateName(resume.name) === targetName);
+        if (!cancelled && match?.photo_url) {
+          setResolvedPhotoUrl(match.photo_url);
+        }
+      } catch {
+        // Keep initials fallback when a photo cannot be resolved.
+      }
+    }
+
+    resolvePhoto();
+    return () => {
+      cancelled = true;
+    };
+  }, [candidateName, resumeId, resolvedPhotoUrl]);
+
+  if (resolvedPhotoUrl) {
+    return (
+      <img
+        src={resolvedPhotoUrl}
+        alt={candidateName}
+        className={className}
+        onError={() => setResolvedPhotoUrl('')}
+      />
+    );
+  }
+
+  return (
+    <div className={`${className} bg-slate-100 flex items-center justify-center text-slate-500 text-sm font-bold`}>
+      {initials}
+    </div>
+  );
+}
+
+function ChatMatchRow({ item, rank }: { item: ParsedMatchCard; rank: number }) {
+  const [open, setOpen] = useState(false);
+  const color = gradeColor(item.fitScore);
+
+  return (
+    <div className={`border rounded-xl overflow-hidden bg-white ${color.border}`}>
+      <button
+        onClick={() => setOpen((value) => !value)}
+        className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-slate-50 transition-colors"
+      >
+        <span className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${color.bg} ${color.text} shrink-0`}>
+          {rank}
+        </span>
+        <CandidatePhoto
+          candidateName={item.candidateName}
+          resumeId={item.resumeId}
+          photoUrl={item.photoUrl}
+          className="w-12 h-12 rounded-xl object-cover border-2 border-slate-100 shrink-0"
+        />
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className="text-sm font-black text-slate-900 truncate uppercase">{item.candidateName}</p>
+            {item.resumeId && (
+              <span className="text-[10px] text-blue-600 font-bold shrink-0">ID {item.resumeId}</span>
+            )}
+          </div>
+          <p className="text-xs text-slate-500 -mt-0.5 italic truncate">
+            {item.designation || 'Profile'}{item.experienceYears ? ` - ${item.experienceYears}` : ''}
+          </p>
+          <div className="flex flex-wrap gap-1 mt-1">
+            <MiniBadge label="Skills" value={item.breakdown.skills} max={35} />
+            <MiniBadge label="Domain" value={item.breakdown.domain} max={25} />
+            <MiniBadge label="Edu" value={item.breakdown.edu} max={15} />
+            <MiniBadge label="Certs" value={item.breakdown.certs} max={15} />
+            <MiniBadge label="Exp" value={item.breakdown.exp} max={10} />
+          </div>
+        </div>
+
+        <div className="text-right shrink-0 w-28">
+          <div className={`text-3xl font-black leading-none tracking-tighter ${color.text}`}>{item.fitScore.toFixed(0)}%</div>
+          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mt-1">Match Index</p>
+          <div className="text-[9px] font-black text-slate-500 mt-2 flex items-center justify-end gap-1 uppercase">
+            <span className="bg-white px-1.5 py-0.5 rounded border border-slate-200">ST: {compactScore(item.structuredScore)}</span>
+            <span className="bg-white px-1.5 py-0.5 rounded border border-slate-200">AI: {compactScore(item.aiScore)}</span>
+          </div>
+        </div>
+        <ChevronDown className={cn("w-5 h-5 text-slate-400 shrink-0 transition-transform", open && "rotate-180")} />
+      </button>
+
+      {open && (
+        <div className="px-4 py-4 bg-slate-50 border-t border-slate-100 grid gap-4 md:grid-cols-2">
+          {item.explanation && (
+            <div>
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">AI Judgment</p>
+              <p className="text-xs text-slate-600 leading-relaxed italic border-l-4 border-indigo-100 pl-3">{item.explanation}</p>
+            </div>
+          )}
+          {item.strengths.length > 0 && (
+            <div>
+              <p className="text-[10px] font-black text-emerald-700 uppercase tracking-widest mb-2">Top Strengths</p>
+              <div className="space-y-1.5">
+                {item.strengths.map((strength) => (
+                  <p key={strength} className="text-[11px] text-slate-600 font-medium">{strength}</p>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChatResumeCards({ cards }: { cards: ParsedResumeCard[] }) {
+  if (cards.length === 0) return null;
+
+  return (
+    <div className="bg-white rounded-2xl border border-slate-100 overflow-hidden shadow-sm">
+      <div className="flex items-center gap-4 px-5 py-4 border-b border-slate-50">
+        <div className="w-1.5 h-10 rounded-full bg-blue-50 border-l-4 border-blue-200/50" />
+        <div className="flex-1 min-w-0">
+          <h3 className="text-base font-black text-slate-900 uppercase tracking-tight">Candidate Profiles</h3>
+          <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1">
+            {cards.length} validated resume result{cards.length === 1 ? '' : 's'}
+          </p>
+        </div>
+      </div>
+
+      <div className="p-4 space-y-3 bg-slate-50/30">
+        {cards.map((item, idx) => (
+          <div key={`${item.resumeId || item.candidateName}-${idx}`} className="border border-slate-100 rounded-xl overflow-hidden bg-white">
+            <div className="flex items-center gap-4 px-4 py-3">
+              <span className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold bg-blue-50 text-blue-700 shrink-0">
+                {idx + 1}
+              </span>
+              <CandidatePhoto
+                candidateName={item.candidateName}
+                resumeId={item.resumeId}
+                className="w-12 h-12 rounded-xl object-cover border-2 border-slate-100 shrink-0"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-black text-slate-900 truncate uppercase">{item.candidateName}</p>
+                  {item.resumeId && <span className="text-[10px] text-blue-600 font-bold shrink-0">ID {item.resumeId}</span>}
+                  {item.relevance && <span className="text-[10px] text-emerald-600 font-black shrink-0">{item.relevance}</span>}
+                </div>
+                <p className="text-xs text-slate-500 -mt-0.5 italic truncate">
+                  {item.role || 'Profile'}{item.experience ? ` - ${item.experience}` : ''}
+                </p>
+                {item.education && (
+                  <p className="text-[11px] text-slate-500 font-medium mt-1 line-clamp-2">
+                    {item.education}
+                  </p>
+                )}
+                {item.skills.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-2">
+                    {item.skills.map((skill) => (
+                      <span key={skill} className="px-2 py-0.5 rounded-lg bg-slate-50 border border-slate-100 text-[10px] font-bold text-slate-600">
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="text-right shrink-0 hidden sm:block">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Resume</p>
+                <p className="text-lg font-black text-blue-700">Profile</p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ChatMatchCards({ cards }: { cards: ParsedMatchCard[] }) {
+  if (cards.length === 0) return null;
+
+  const groups = cards.reduce<Record<string, ParsedMatchCard[]>>((acc, card) => {
+    acc[card.roleTitle] = acc[card.roleTitle] || [];
+    acc[card.roleTitle].push(card);
+    return acc;
+  }, {});
+
+  return (
+    <div className="space-y-5">
+      {Object.entries(groups).map(([role, roleCards]) => {
+        const sorted = [...roleCards].sort((a, b) => b.fitScore - a.fitScore);
+        const topScore = sorted[0]?.fitScore || 0;
+        const topColor = gradeColor(topScore);
+        return (
+          <div key={role} className="bg-white rounded-2xl border border-slate-100 overflow-hidden shadow-sm">
+            <div className="flex items-center gap-4 px-5 py-4 border-b border-slate-50">
+              <div className={`w-1.5 h-10 rounded-full ${topColor.bg} border-l-4 ${topColor.border}`} />
+              <div className="flex-1 min-w-0">
+                <h3 className="text-base font-black text-slate-900 uppercase tracking-tight truncate">{role}</h3>
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1">
+                  {sorted.length} candidate{sorted.length === 1 ? '' : 's'} from stored match results
+                </p>
+              </div>
+              <div className="text-right shrink-0">
+                <div className={`text-2xl font-black ${topColor.text}`}>{topScore.toFixed(0)}%</div>
+                <div className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Top Match</div>
+              </div>
+            </div>
+            <div className="p-4 space-y-3 bg-slate-50/30">
+              {sorted.map((item, idx) => (
+                <ChatMatchRow key={`${item.resumeId || item.candidateName}-${item.roleTitle}`} item={item} rank={idx + 1} />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function Chat() {
@@ -253,7 +727,10 @@ export default function Chat() {
               </div>
             )}
 
-            {messages.map((msg, i) => (
+            {messages.map((msg, i) => {
+              const matchCards = msg.role === 'assistant' ? getMatchCardsFromMessage(msg) : [];
+              const resumeCards = msg.role === 'assistant' && matchCards.length === 0 ? getResumeCardsFromMessage(msg) : [];
+              return (
               <div key={i} className={cn(
                 "flex animate-in fade-in slide-in-from-bottom-4 duration-500",
                 msg.role === 'user' ? 'justify-end' : 'justify-start'
@@ -301,6 +778,10 @@ export default function Chat() {
                   )}>
                     {msg.role === 'user' ? (
                       <div className="font-bold tracking-tight">{msg.content}</div>
+                    ) : matchCards.length > 0 ? (
+                      <ChatMatchCards cards={matchCards} />
+                    ) : resumeCards.length > 0 ? (
+                      <ChatResumeCards cards={resumeCards} />
                     ) : (
                       <MarkdownRenderer content={msg.content} />
                     )}
@@ -347,7 +828,8 @@ export default function Chat() {
                   ))}
                 </div>
               </div>
-            ))}
+              );
+            })}
 
             {loading && (
               <div className="flex justify-start animate-pulse">
