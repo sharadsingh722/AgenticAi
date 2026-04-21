@@ -10,8 +10,11 @@ import {
   Zap,
   ShieldCheck,
   Terminal,
-  ChevronDown
+  ChevronDown,
+  ChevronRight,
+  ExternalLink
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import { cn } from '../utils/utils';
 import { getResume, listResumes } from '../api/client';
@@ -53,6 +56,11 @@ interface ParsedResumeCard {
   education?: string;
   skills: string[];
   relevance?: string;
+}
+
+interface ParsedChoice {
+  label: string;
+  value: string;
 }
 
 let resumeListCache: Promise<Resume[]> | null = null;
@@ -340,7 +348,12 @@ function ChatMatchRow({ item, rank }: { item: ParsedMatchCard; rank: number }) {
           <div className="flex items-center gap-2">
             <p className="text-sm font-black text-slate-900 truncate uppercase">{item.candidateName}</p>
             {item.resumeId && (
-              <span className="text-[10px] text-blue-600 font-bold shrink-0">ID {item.resumeId}</span>
+              <Link
+                to={`/resumes/${item.resumeId}`}
+                className="flex items-center gap-1.5 text-[10px] text-blue-600 font-bold hover:text-blue-700 transition-colors bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-100 uppercase tracking-wider"
+              >
+                Open Resume <ExternalLink className="w-2.5 h-2.5" />
+              </Link>
             )}
           </div>
           <p className="text-xs text-slate-500 -mt-0.5 italic truncate">
@@ -420,7 +433,14 @@ function ChatResumeCards({ cards }: { cards: ParsedResumeCard[] }) {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <p className="text-sm font-black text-slate-900 truncate uppercase">{item.candidateName}</p>
-                  {item.resumeId && <span className="text-[10px] text-blue-600 font-bold shrink-0">ID {item.resumeId}</span>}
+                  {item.resumeId && (
+                    <Link
+                      to={`/resumes/${item.resumeId}`}
+                      className="flex items-center gap-1.5 text-[10px] text-blue-600 font-bold hover:text-blue-700 transition-colors bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-100 uppercase tracking-wider"
+                    >
+                      Open Resume <ExternalLink className="w-2.5 h-2.5" />
+                    </Link>
+                  )}
                   {item.relevance && <span className="text-[10px] text-emerald-600 font-black shrink-0">{item.relevance}</span>}
                 </div>
                 <p className="text-xs text-slate-500 -mt-0.5 italic truncate">
@@ -495,12 +515,57 @@ function ChatMatchCards({ cards }: { cards: ParsedMatchCard[] }) {
   );
 }
 
+function ChatChoices({ question, choices, onSelect, disabled }: { question?: string; choices: ParsedChoice[]; onSelect: (label: string, value: string) => void; disabled?: boolean }) {
+  if (choices.length === 0) return null;
+
+  return (
+    <div className="w-full mb-[-1.5rem] animate-in slide-in-from-bottom-4 fade-in duration-500 relative z-30">
+      <div className="w-full bg-white border border-slate-200 rounded-t-[2.5rem] rounded-b-[1.5rem] shadow-[0_-20px_50px_-15px_rgba(0,0,0,0.1)] overflow-hidden">
+        <div className="flex items-center gap-3 px-8 py-5 border-b border-slate-100/50 bg-slate-50/50">
+            <div className="w-8 h-8 rounded-xl bg-violet-600 flex items-center justify-center shadow-lg shadow-violet-200">
+                <BrainCircuit className="w-4 h-4 text-white" />
+            </div>
+            <div className="flex-1">
+                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">Agentic Intelligence</h3>
+                <p className="text-[11px] font-bold text-slate-800 line-clamp-1">{question || "Awaiting your selection to proceed..."}</p>
+            </div>
+            <span className="text-[9px] font-black text-violet-600 bg-violet-50 px-3 py-1.5 rounded-full uppercase tracking-widest border border-violet-100 animate-pulse">Decision Point</span>
+        </div>
+        <div className="p-4 bg-white/50">
+          <div className="flex flex-col gap-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-1">
+            {choices.map((choice, i) => (
+              <button
+                key={i}
+                onClick={() => !disabled && onSelect(choice.label, choice.value)}
+                disabled={disabled}
+                className="group flex items-center gap-4 w-full px-5 py-4 bg-slate-50/50 hover:bg-violet-600 border border-slate-100 rounded-2xl transition-all shadow-sm hover:shadow-lg hover:shadow-violet-200 active:scale-[0.98] disabled:opacity-50"
+              >
+                <div className="w-8 h-8 rounded-full bg-slate-800 text-white flex items-center justify-center text-[10px] font-black group-hover:bg-white group-hover:text-violet-600 transition-colors shrink-0 shadow-sm">
+                  {i + 1}
+                </div>
+                <div className="flex-1 text-left">
+                  <p className="text-[12px] font-black text-slate-700 group-hover:text-white transition-colors leading-tight">
+                    {choice.label}
+                  </p>
+                </div>
+                <ChevronRight className="w-4 h-4 text-slate-300 group-hover:text-white transition-colors" />
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<ChatMsg[]>(() => {
     const saved = localStorage.getItem('chat_messages');
     return saved ? JSON.parse(saved) : [];
   });
   const [input, setInput] = useState('');
+  const [pendingChoices, setPendingChoices] = useState<ParsedChoice[]>([]);
+  const [pendingQuestion, setPendingQuestion] = useState('');
   const [placeholder, setPlaceholder] = useState('Instruct the AI assistant...');
   const [loading, setLoading] = useState(false);
   const [sessionId] = useState(() => {
@@ -577,11 +642,22 @@ export default function Chat() {
     });
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || loading) return;
-    const userMsg = input.trim();
-    setInput('');
-    setMessages((prev) => [...prev, { role: 'user', content: userMsg }]);
+  const handleChoiceSelect = (label: string, value: string) => {
+    setPendingChoices([]);
+    setPendingQuestion('');
+    handleSend(value, label);
+  };
+
+  const handleSend = async (overrideMsg?: string, displayLabel?: string) => {
+    const msgToSubmit = overrideMsg || input.trim();
+    if (!msgToSubmit || loading) return;
+
+    if (!overrideMsg) setInput('');
+    setPendingChoices([]);
+    setPendingQuestion('');
+    
+    const displayMsg = displayLabel ? `I've selected: ${displayLabel}` : msgToSubmit;
+    setMessages((prev) => [...prev, { role: 'user', content: displayMsg }]);
     setLoading(true);
     setCurrentTool('');
     let thinkingText = '';
@@ -592,7 +668,7 @@ export default function Chat() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sessionId, message: userMsg }),
+        body: JSON.stringify({ session_id: sessionId, message: msgToSubmit }),
       });
 
       if (!response.ok) throw new Error('Chat request failed');
@@ -630,10 +706,25 @@ export default function Chat() {
               }
             } else if (event.event === 'answer') {
               setCurrentTool('');
-              setMessages((prev) => [
-                ...prev,
-                { role: 'assistant', content: event.content, thought: thinkingText, toolCalls: [...toolCalls] },
-              ]);
+              const content = event.content;
+              const choiceRegex = /\[\[CHOICE:\s*(.*?)\s*\|\s*(.*?)\s*\]\]/g;
+              const choices: ParsedChoice[] = [];
+              let match;
+              while ((match = choiceRegex.exec(content)) !== null) {
+                choices.push({ label: match[1], value: match[2] });
+              }
+
+              if (choices.length > 0) {
+                setPendingChoices(choices);
+                // Extract question text before the choices tag
+                const question = content.split('[[CHOICE:')[0].trim();
+                setPendingQuestion(question);
+              } else {
+                setMessages((prev) => [
+                  ...prev,
+                  { role: 'assistant', content, thought: thinkingText, toolCalls: [...toolCalls] },
+                ]);
+              }
             } else if (event.event === 'error') {
               setCurrentTool('');
               setMessages((prev) => [
@@ -783,7 +874,7 @@ export default function Chat() {
                     ) : resumeCards.length > 0 ? (
                       <ChatResumeCards cards={resumeCards} />
                     ) : (
-                      <MarkdownRenderer content={msg.content} />
+                      <MarkdownRenderer content={msg.content.replace(/\[\[CHOICE:.*?\]\]/g, '').trim()} />
                     )}
                   </div>
 
@@ -844,7 +935,13 @@ export default function Chat() {
 
         {/* ChatGPT Style Command Dock */}
         <div className="w-full bg-white border-t border-slate-100 px-4 md:px-8 py-4 md:py-6 z-20">
-          <div className="w-full max-w-4xl mx-auto">
+          <div className="w-full max-w-4xl mx-auto flex flex-col gap-0">
+            <ChatChoices
+              question={pendingQuestion}
+              choices={pendingChoices}
+              onSelect={handleChoiceSelect}
+              disabled={loading}
+            />
             <div className={cn(
               "relative p-1.5 md:p-2 bg-white border border-slate-200/60 rounded-[1.5rem] md:rounded-[2rem] transition-all duration-500 group",
               input.trim() ? "shadow-[0_10px_40px_-10px_rgba(124,58,237,0.15)] ring-1 ring-violet-500/10" : "shadow-sm",
@@ -870,7 +967,7 @@ export default function Chat() {
                   disabled={loading}
                 />
                 <button
-                  onClick={handleSend}
+                  onClick={() => handleSend()}
                   disabled={!input.trim() || loading}
                   className={cn(
                     "mb-0.5 md:mb-1 p-3 md:px-6 md:py-4 rounded-[1.2rem] md:rounded-[1.5rem] text-white transition-all active:scale-90 flex items-center gap-3 overflow-hidden group/btn relative shrink-0",

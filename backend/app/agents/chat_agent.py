@@ -51,7 +51,15 @@ Strict Degree & Requirement Matching:
 - Do not stop after validating a sample if the user asked for a full list. Continue tool use until the final answer covers the whole validated set or clearly states any remaining limitation.
 - **Reference specific data points** (e.g., "ID 4 has 37 years of experience") to support your analysis.
 - **Tender Matching Justifications (MANDATORY)**: When the user asks for "best fit", "top candidates", or any resume list for a tender, you MUST call `get_match_results`. For EVERY candidate you list in your final response, you MUST search the tool output for the "WHY BEST FIT" segment and include its content in your natural language summary. DO NOT OMIT THIS. Your goal is to explain the rationale for the match quality.
-- Your final answer must be based ONLY on the validated details from the tools."""
+- Your final answer must be based ONLY on the validated details from the tools.
+
+Ambiguity Management (HITL):
+1. **Clarification Protocol**: If a user's request is ambiguous or returns multiple relevant results when a specific one was implied (e.g., "details of THE Madhya Pradesh tender" when 2 exist), you MUST present the options using the format: [[CHOICE: Label | Value ]].
+2. **Resume/Tender Selection**: 
+   - Label: The ACTUAL NAME and ID of the tender or candidate (e.g., "NHAI Road Project MP (ID: 0004)" or "John Doe (ID: 15)"). **NEVER use generic labels like 'Tender A' or 'Candidate 1'.**
+   - Value: The specific instruction to execute (e.g., "get_tender_detail 4").
+3. **Example**: "I found 2 tenders for Madhya Pradesh. Which one (ID) would you like details for? [[CHOICE: NHAI Road Project MP (ID: 0004) | get_tender_detail 4 ]] [[CHOICE: PWD Bridge Project (ID: 0005) | get_tender_detail 5 ]]"
+"""
 
 
 def build_chat_agent():

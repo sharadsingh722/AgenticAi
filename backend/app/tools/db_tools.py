@@ -326,6 +326,23 @@ def _resolve_common_values(category: str, user_query: str, items: list[dict]) ->
     if not selected:
         selected = _fallback_resolve_common_values(category, user_query, items)
 
+    # HITL: Detect if the result is still too broad or ambiguous for a precise search
+    if len(selected) > 5 or (not selected and items):
+        # Generate choices for the agent to present to the user
+        vague_terms = {"masters", "degree", "graduation", "post graduation", "postgraduation", "engineering", "bachelors"}
+        if user_query.lower() in vague_terms or not selected:
+            choices = []
+            # Take a few top items or items related to the level if inferred
+            limit = 6
+            for item in items[:limit]:
+                label = item.get("display_label", item["name"])
+                choices.append(f"[[CHOICE: {label} | {item['name']} ]]")
+            
+            choice_str = " ".join(choices)
+            logger.info("HITL triggered for %s. Choices: %s", category, choice_str)
+            # We return this special string which the tool-calling logic will pass to the agent
+            return [f"HITL_CHOICES: {choice_str}"]
+
     return selected
 
 
@@ -565,12 +582,16 @@ def sql_query_resumes(
         if skills:
             skill_items = _load_common_items(db, "skills")
             resolved_skills = _resolve_common_values("skills", skills, skill_items)
+            if resolved_skills and resolved_skills[0].startswith("HITL_CHOICES:"):
+                return f"I need clarification on the skills: {resolved_skills[0].replace('HITL_CHOICES:', '').strip()}"
             query = _apply_standardized_json_filter(query, Resume.standardized_skills, resolved_skills)
             base_query = _apply_standardized_json_filter(base_query, Resume.standardized_skills, resolved_skills)
 
         if education:
             education_items = _load_common_items(db, "education")
             resolved_education = _resolve_common_values("education", education, education_items)
+            if resolved_education and resolved_education[0].startswith("HITL_CHOICES:"):
+                return f"I found several matching qualifications. Which one are you looking for? {resolved_education[0].replace('HITL_CHOICES:', '').strip()}"
             query = _apply_standardized_json_filter(query, Resume.standardized_education, resolved_education)
 
         if domain:
