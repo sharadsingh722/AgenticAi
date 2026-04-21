@@ -624,11 +624,13 @@ def sql_query_resumes(
             raw_skills = json.loads(resume.skills) if resume.skills else []
             education_list = json.loads(resume.education) if resume.education else []
             std_edu = json.loads(resume.standardized_education) if resume.standardized_education else []
+            photo_url = f"/api/resumes/photo/{resume.photo_filename}" if resume.photo_filename else ""
             results.append(
                 f"- {resume.name} (ID:{resume.id}) | {current_role} | "
                 f"{resume.total_years_experience} yrs | "
                 f"Education: {', '.join(education_list)} | "
                 f"Std-Edu: {', '.join(std_edu)} | "
+                f"Photo: {photo_url} | "
                 f"Skills: {', '.join(raw_skills[:8])}"
             )
 

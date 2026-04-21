@@ -78,6 +78,43 @@ export async function getMatchResults(tenderId: number): Promise<MatchResponse[]
   return data;
 }
 
+// --- Chat ---
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessage {
+  id: number;
+  session_id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls: string | null;
+  created_at: string;
+}
+
+export async function listSessions(): Promise<ChatSession[]> {
+  const { data } = await api.get<ChatSession[]>('/chat/sessions');
+  return data;
+}
+
+export async function createSession(id: string): Promise<ChatSession> {
+  const { data } = await api.post<ChatSession>('/chat/sessions', null, { params: { session_id: id } });
+  return data;
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  await api.delete(`/chat/sessions/${id}`);
+}
+
+export async function getChatHistory(sessionId: string): Promise<ChatMessage[]> {
+  const { data } = await api.get<ChatMessage[]>(`/chat/history/${sessionId}`);
+  return data;
+}
+
 // --- Smart Upload (SSE) ---
 
 export interface SmartUploadEvent {

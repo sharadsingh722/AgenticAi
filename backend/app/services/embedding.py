@@ -44,6 +44,11 @@ tender_chunk_collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"},
 )
 
+tender_collection = chroma_client.get_or_create_collection(
+    name="tenders",
+    metadata={"hnsw:space": "cosine"},
+)
+
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """Generate embeddings for a list of texts using OpenAI.
@@ -115,6 +120,20 @@ def query_similar_resumes(
     return results
 
 
+def store_tender_embedding(
+    tender_id: int,
+    embedding: list[float],
+    metadata: dict,
+) -> None:
+    """Store a high-level tender embedding in ChromaDB."""
+    tender_collection.upsert(
+        ids=[str(tender_id)],
+        embeddings=[embedding],
+        metadatas=[metadata],
+        documents=[metadata.get("project_name", "")],
+    )
+
+
 def store_tender_role_embedding(
     tender_id: int,
     role_index: int,
@@ -131,10 +150,29 @@ def store_tender_role_embedding(
     )
 
 
+def query_similar_tenders(
+    query_embedding: list[float],
+    n_results: int = 15,
+) -> dict:
+    """Query ChromaDB for tenders similar to the given embedding."""
+    count = tender_collection.count()
+    if count == 0:
+        return {"ids": [[]], "distances": [[]], "metadatas": [[]]}
+
+    n = min(n_results, count)
+    return tender_collection.query(
+        query_embeddings=[query_embedding],
+        n_results=n,
+    )
+
+
 def delete_tender_embeddings(tender_id: int) -> None:
-    """Remove all role embeddings for a tender."""
+    """Remove all embeddings for a tender (main, roles, and chunks)."""
     try:
-        # Get all IDs for this tender
+        # Delete from main tender collection
+        tender_collection.delete(ids=[str(tender_id)])
+
+        # Get all IDs for this tender's roles
         results = tender_role_collection.get(
             where={"tender_id": tender_id},
         )

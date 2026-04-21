@@ -1,5 +1,6 @@
 """Chat router with streaming responses from the chat agent."""
 import json
+from datetime import datetime
 import logging
 import traceback
 from fastapi import APIRouter, Depends
@@ -8,8 +9,8 @@ from sqlalchemy.orm import Session
 from langchain_core.messages import HumanMessage, AIMessage
 
 from app.database import get_db
-from app.models import ChatMessage
-from app.schemas import ChatRequest, ChatMessageResponse
+from app.models import ChatMessage, ChatSession
+from app.schemas import ChatRequest, ChatMessageResponse, ChatSessionResponse
 from app.agents.chat_agent import chat_agent
 from app.utils.streaming import sse_event
 
@@ -17,11 +18,55 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
+@router.get("/sessions", response_model=list[ChatSessionResponse])
+async def list_sessions(db: Session = Depends(get_db)):
+    """List all chat sessions ordered by update time."""
+    return db.query(ChatSession).order_by(ChatSession.updated_at.desc()).all()
+
+
+@router.post("/sessions", response_model=ChatSessionResponse)
+async def create_session(session_id: str, db: Session = Depends(get_db)):
+    """Create a new chat session."""
+    session = ChatSession(id=session_id)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return session
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, db: Session = Depends(get_db)):
+    """Delete a session and all its messages."""
+    db.query(ChatMessage).filter(ChatMessage.session_id == session_id).delete()
+    db.query(ChatSession).filter(ChatSession.id == session_id).delete()
+    db.commit()
+    return {"message": "Session deleted"}
+
+
 @router.post("")
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """Chat endpoint with SSE streaming. Sends thinking, tool calls, and answer tokens."""
     session_id = request.session_id
     user_message = request.message
+
+    # Ensure session exists
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session:
+        session = ChatSession(id=session_id, title="New Chat")
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+
+    # If first message, update title
+    msg_count = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).count()
+    if msg_count == 0:
+        # Simple title generator: first 30 chars
+        title = user_message[:30] + "..." if len(user_message) > 30 else user_message
+        session.title = title
+
+    # Update session time
+    session.updated_at = datetime.utcnow()
+    db.commit()
 
     # Save user message
     db_msg = ChatMessage(

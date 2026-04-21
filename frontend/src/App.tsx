@@ -18,6 +18,7 @@ function App() {
           <Route path="/tenders/:id" element={<TenderView />} />
           <Route path="/matching" element={<Matching />} />
           <Route path="/chat" element={<Chat />} />
+          <Route path="/chat/:sessionId" element={<Chat />} />
           <Route path="*" element={<Navigate to="/resumes" replace />} />
         </Route>
       </Routes>

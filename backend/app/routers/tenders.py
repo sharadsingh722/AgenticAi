@@ -123,6 +123,19 @@ async def upload_tender(
     db.commit()
     db.refresh(db_tender)
 
+    # Generate tender-level embedding for semantic search
+    if parse_status == "success":
+        try:
+            tender_summary = f"{db_tender.project_name}. {db_tender.client or ''}. {db_tender.raw_text[:500]}"
+            tender_embeddings = await embed_texts([tender_summary])
+            store_tender_embedding(
+                db_tender.id, 
+                tender_embeddings[0], 
+                {"tender_id": db_tender.id, "project_name": db_tender.project_name, "client": db_tender.client or "N/A"}
+            )
+        except Exception as e:
+            logger.error(f"Failed to store main tender embedding for {db_tender.id}: {e}")
+
     # Generate embeddings for each role
     if parse_status == "success" and parsed.required_roles:
         try:
