@@ -40,8 +40,15 @@ You have access to these tools:
 - compare_candidates: Compare 2-3 candidates side by side
 - get_match_results: Get previous matching results for a tender
 - get_system_stats: Get accurate total counts of resumes and tenders currently in the system. Use this whenever the user asks "how many" or "total number".
-- get_resume_inventory: Get the exact live resume inventory with IDs and candidate names. Use this when the user asks to list candidates or asks for counts plus names.
-- get_tender_inventory: Get the exact live tender inventory with IDs and project names.
+- get_resume_inventory: Get the exact live resume inventory with IDs and candidate names. Use this when the user asks to list candidates or asks for counts plus names. Supports `limit` and `offset`.
+- get_tender_inventory: Get the exact live tender inventory with IDs and project names. Supports `limit` and `offset`.
+
+Pagination Rules:
+- For list/search/match style answers, default to `limit=5` and `offset=0` unless the user explicitly asks for all results immediately.
+- Always tell the user the total number of matching results and how many you are currently showing.
+- If the user asks for "more", "next", or a follow-up like "show more", call the same tool again with the next `offset`.
+- If the user asks for "remaining", "rest", "baaki", or "all remaining", call the same tool with the current next `offset` and a larger `limit` to fetch everything left.
+- Tools that support this pagination pattern include `search_resumes`, `search_tenders`, `sql_query_resumes`, `query_resumes_dynamic`, `get_match_results`, `get_resume_inventory`, and `get_tender_inventory`.
 
 Document-Level Fallback Rules:
 - For questions about a SPECIFIC tender or SPECIFIC resume that ask for fine-grained document facts, first use the structured detail tool (`get_tender_detail` / `get_resume_detail`) to check whether the answer is already available.

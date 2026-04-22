@@ -9,10 +9,37 @@ from app.services.embedding import embed_texts, query_similar_resumes
 from app.database import SessionLocal
 from app.models import Resume, Tender
 
+DEFAULT_RESULT_LIMIT = 5
+
+
+def _build_paginated_text_response(items: list[str], *, label: str, limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
+    safe_limit = max(1, min(int(limit or DEFAULT_RESULT_LIMIT), 50))
+    safe_offset = max(0, int(offset or 0))
+    total = len(items)
+    page = items[safe_offset:safe_offset + safe_limit]
+
+    lines = [f"Total matching {label}: {total}"]
+    if not page:
+        lines.append(f"Showing 0 of {total} result(s). No more results remain for offset {safe_offset}.")
+        return "\n".join(lines)
+
+    start_index = safe_offset + 1
+    end_index = safe_offset + len(page)
+    lines.append(f"Showing {len(page)} of {total} result(s) ({start_index}-{end_index}).")
+    lines.extend(page)
+
+    remaining = max(0, total - end_index)
+    if remaining > 0:
+        lines.append(
+            f"{remaining} more result(s) remain. Call this tool again with offset={end_index} "
+            f"and limit={DEFAULT_RESULT_LIMIT} for the next page, or limit={remaining} to fetch the rest."
+        )
+    return "\n".join(lines)
+
 
 @tool
-def search_resumes(query: str) -> str:
-    """Search resumes by semantic similarity. Use for natural language queries like 'find candidates with drone experience' or 'engineers with GIS skills'."""
+def search_resumes(query: str, limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
+    """Search resumes by semantic similarity. Use limit/offset for pagination."""
     async def _run():
         embeddings = await embed_texts([query])
         results = query_similar_resumes(embeddings[0], n_results=50)
@@ -52,7 +79,9 @@ def search_resumes(query: str) -> str:
                     f"Skills: {', '.join(json.loads(resume.skills)[:8])} | "
                     f"Relevance: {similarity:.0%}"
                 )
-            return "\n".join(output) if output else "No matching resumes found."
+            if not output:
+                return "No matching resumes found."
+            return _build_paginated_text_response(output, label="resumes", limit=limit, offset=offset)
         finally:
             db.close()
 
@@ -60,8 +89,8 @@ def search_resumes(query: str) -> str:
 
 
 @tool
-def search_tenders(query: str) -> str:
-    """Search tenders/RFPs by semantic similarity. Use for natural language queries like 'infrastructure projects' or 'IT projects in Bihar'."""
+def search_tenders(query: str, limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
+    """Search tenders/RFPs by semantic similarity. Use limit/offset for pagination."""
     async def _run():
         embeddings = await embed_texts([query])
         from app.services.embedding import query_similar_tenders
@@ -99,7 +128,9 @@ def search_tenders(query: str) -> str:
                     f"{tender.client or 'N/A'} | {len(roles)} roles | "
                     f"Tech: {', '.join(techs[:5])} | Relevance: {similarity:.0%}"
                 )
-            return "\n".join(output) if output else "No matching tenders found."
+            if not output:
+                return "No matching tenders found."
+            return _build_paginated_text_response(output, label="tenders", limit=limit, offset=offset)
         finally:
             db.close()
 

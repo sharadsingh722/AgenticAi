@@ -15,6 +15,8 @@ from app.services.llm import get_reasoning_llm
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_RESULT_LIMIT = 5
+
 EDUCATION_LEVEL_EQUIVALENTS = {
     "graduate": {"graduate", "undergraduate", "bachelor", "bachelors", "graduation", "degree"},
     "postgraduate": {"postgraduate", "post", "master", "masters", "pg", "postgraduation", "post_graduation"},
@@ -80,6 +82,43 @@ class ResumeQueryInterpretation(BaseModel):
     excluded_skill_queries: list[str] = Field(default_factory=list)
     domain_query: Optional[str] = None
     intent_notes: list[str] = Field(default_factory=list)
+
+
+def _sanitize_pagination(limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0, max_limit: int = 50) -> tuple[int, int]:
+    safe_limit = max(1, min(int(limit or DEFAULT_RESULT_LIMIT), max_limit))
+    safe_offset = max(0, int(offset or 0))
+    return safe_limit, safe_offset
+
+
+def _build_paginated_text_response(
+    items: list[str],
+    *,
+    label: str,
+    limit: int = DEFAULT_RESULT_LIMIT,
+    offset: int = 0,
+) -> str:
+    safe_limit, safe_offset = _sanitize_pagination(limit, offset)
+    total = len(items)
+    page = items[safe_offset:safe_offset + safe_limit]
+
+    lines = [f"Total matching {label}: {total}"]
+    if not page:
+        lines.append(f"Showing 0 of {total} result(s). No more results remain for offset {safe_offset}.")
+        return "\n".join(lines)
+
+    start_index = safe_offset + 1
+    end_index = safe_offset + len(page)
+    lines.append(f"Showing {len(page)} of {total} result(s) ({start_index}-{end_index}).")
+    lines.extend(page)
+
+    remaining = max(0, total - end_index)
+    if remaining > 0:
+        next_offset = end_index
+        lines.append(
+            f"{remaining} more result(s) remain. Call this tool again with offset={next_offset} "
+            f"and limit={DEFAULT_RESULT_LIMIT} for the next page, or limit={remaining} to fetch the rest."
+        )
+    return "\n".join(lines)
 
 
 def _unique_preserve(values: list[str]) -> list[str]:
@@ -1029,8 +1068,10 @@ def sql_query_resumes(
     skills: Optional[str] = None,
     domain: Optional[str] = None,
     education: Optional[str] = None,
+    limit: int = DEFAULT_RESULT_LIMIT,
+    offset: int = 0,
 ) -> str:
-    """Query resumes with structured filters."""
+    """Query resumes with structured filters. Use limit/offset for pagination."""
     db = SessionLocal()
     try:
         query = db.query(Resume)
@@ -1125,16 +1166,24 @@ def sql_query_resumes(
         if header_parts:
             response_parts.append("\n".join(header_parts))
         response_parts.append(f"Generated SQL:\n```sql\n{compiled_sql}\n```")
-        response_parts.append("\n".join(results[:20]))
+        response_parts.append(
+            _build_paginated_text_response(
+                results,
+                label="resumes",
+                limit=limit,
+                offset=offset,
+            )
+        )
         return "\n".join(response_parts)
     finally:
         db.close()
 
 
 @tool
-def query_resumes_dynamic(query: str) -> str:
+def query_resumes_dynamic(query: str, limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
     """Interpret a natural-language resume query into strict structured filters and return validated results.
     Use this for user questions combining education/background, skills, and experience constraints.
+    Use limit/offset for pagination.
     """
     db = SessionLocal()
     try:
@@ -1217,7 +1266,8 @@ def query_resumes_dynamic(query: str) -> str:
             lines.append("No resumes match the validated filters.")
             return "\n".join(lines)
 
-        for resume in validated[:20]:
+        result_lines = []
+        for resume in validated:
             parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
             experience = parsed.get("experience", [])
             current_role = experience[0].get("role", "N/A") if experience else "N/A"
@@ -1225,7 +1275,7 @@ def query_resumes_dynamic(query: str) -> str:
             education_list = json.loads(resume.education) if resume.education else []
             std_edu = json.loads(resume.standardized_education) if resume.standardized_education else []
             photo_url = f"/api/resumes/photo/{resume.photo_filename}" if resume.photo_filename else ""
-            lines.append(
+            result_lines.append(
                 f"- {resume.name} (ID:{resume.id}) | {current_role} | "
                 f"{resume.total_years_experience} yrs | "
                 f"Education: {', '.join(education_list)} | "
@@ -1233,20 +1283,33 @@ def query_resumes_dynamic(query: str) -> str:
                 f"Photo: {photo_url} | "
                 f"Skills: {', '.join(raw_skills[:8])}"
             )
+        lines.append(
+            _build_paginated_text_response(
+                result_lines,
+                label="validated resumes",
+                limit=limit,
+                offset=offset,
+            )
+        )
         return "\n".join(lines)
     finally:
         db.close()
 
 
 @tool
-def get_match_results(tender_id: int, role_title: Optional[str] = None) -> str:
-    """Get existing match results for a tender."""
+def get_match_results(
+    tender_id: int,
+    role_title: Optional[str] = None,
+    limit: int = DEFAULT_RESULT_LIMIT,
+    offset: int = 0,
+) -> str:
+    """Get existing match results for a tender. Use limit/offset for pagination."""
     db = SessionLocal()
     try:
         query = db.query(MatchResult).filter(MatchResult.tender_id == tender_id)
         if role_title:
             query = query.filter(MatchResult.role_title == role_title)
-        matches = query.order_by(MatchResult.final_score.desc()).limit(20).all()
+        matches = query.order_by(MatchResult.final_score.desc()).all()
 
         if not matches:
             return f"No match results found for tender {tender_id}."
@@ -1287,43 +1350,67 @@ def get_match_results(tender_id: int, role_title: Optional[str] = None) -> str:
                 summary += f" | TOP STRENGTHS: {', '.join(strengths)}"
             
             results.append(summary)
-        return "\n".join(results)
+        return _build_paginated_text_response(
+            results,
+            label=f"match results for tender {tender_id}",
+            limit=limit,
+            offset=offset,
+        )
     finally:
         db.close()
 
 
 @tool
-def get_resume_inventory() -> str:
+def get_resume_inventory(limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
     """Get the exact current resume inventory with total count, IDs, names, and key summary fields.
     Use this for questions asking how many resumes exist, which candidates are available, or to list candidate names.
+    Use limit/offset for pagination.
     """
     db = SessionLocal()
     try:
         resumes = db.query(Resume).order_by(Resume.id.asc()).all()
-        lines = [f"RESUME INVENTORY SUMMARY:", f"- Total Resumes: {len(resumes)}"]
+        results = []
         for resume in resumes:
             parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
             experience = parsed.get("experience", [])
             current_role = experience[0].get("role", "N/A") if experience else "N/A"
-            lines.append(
+            results.append(
                 f"- ID {resume.id}: {resume.name} | Role: {current_role} | Experience: {resume.total_years_experience:g} yrs"
             )
+        lines = ["RESUME INVENTORY SUMMARY:"]
+        lines.append(
+            _build_paginated_text_response(
+                results,
+                label="resumes",
+                limit=limit,
+                offset=offset,
+            )
+        )
         return "\n".join(lines)
     finally:
         db.close()
 
 
 @tool
-def get_tender_inventory() -> str:
-    """Get the exact current tender inventory with total count, IDs, and project names."""
+def get_tender_inventory(limit: int = DEFAULT_RESULT_LIMIT, offset: int = 0) -> str:
+    """Get the exact current tender inventory with total count, IDs, and project names. Use limit/offset for pagination."""
     db = SessionLocal()
     try:
         tenders = db.query(Tender).order_by(Tender.id.asc()).all()
-        lines = [f"TENDER INVENTORY SUMMARY:", f"- Total Tenders: {len(tenders)}"]
+        results = []
         for tender in tenders:
-            lines.append(
+            results.append(
                 f"- TND-{tender.id:04d}: {tender.project_name} | Client: {tender.client or 'N/A'}"
             )
+        lines = ["TENDER INVENTORY SUMMARY:"]
+        lines.append(
+            _build_paginated_text_response(
+                results,
+                label="tenders",
+                limit=limit,
+                offset=offset,
+            )
+        )
         return "\n".join(lines)
     finally:
         db.close()

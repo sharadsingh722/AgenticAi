@@ -57,6 +57,14 @@ interface ParsedResumeCard {
   profileUrl?: string;
 }
 
+interface ParsedResumeCandidateBlock {
+  card: ParsedResumeCard;
+  role?: string;
+  experience?: string;
+  educationItems: string[];
+  skillsText?: string;
+}
+
 interface ParsedTenderCard {
   tenderId: number;
   projectName: string;
@@ -392,6 +400,133 @@ function parseResumeSections(content: string) {
   return { intro: intro.join('\n').trim(), sections };
 }
 
+function findResumeCardByHeader(line: string, cards: ParsedResumeCard[]) {
+  const idMatch = line.match(/\(ID:\s*(\d+)\)/i);
+  if (idMatch) {
+    const resumeId = Number(idMatch[1]);
+    const byId = cards.find((card) => card.resumeId === resumeId);
+    if (byId) return byId;
+  }
+
+  const candidateMatch = line.match(/^\s*(?:[-*]\s+)?\*\*(.+?)\*\*(?:\s*\(ID:\s*(\d+)\))?\s*$/);
+  const candidateName = candidateMatch?.[1]?.trim();
+  if (!candidateName) return undefined;
+
+  const normalizedName = normalizeCandidateName(candidateName);
+  return cards.find((card) => normalizeCandidateName(card.candidateName) === normalizedName);
+}
+
+function parseResumeCandidateBlocks(content: string, cards: ParsedResumeCard[]) {
+  const lines = content.split('\n');
+  const introLines: string[] = [];
+  const outroLines: string[] = [];
+  const candidates: ParsedResumeCandidateBlock[] = [];
+  let current: ParsedResumeCandidateBlock | null = null;
+  let inEducation = false;
+  let sawCandidate = false;
+
+  const flushCurrent = () => {
+    if (!current) return;
+    candidates.push(current);
+    current = null;
+    inEducation = false;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    const candidateMatch = trimmed.match(/^\s*(?:[-*]\s+)?\*\*(.+?)\*\*(?:\s*\(ID:\s*(\d+)\))?\s*$/);
+    if (candidateMatch) {
+      flushCurrent();
+      sawCandidate = true;
+
+      const existingCard = findResumeCardByHeader(trimmed, cards);
+      current = {
+        card: existingCard || {
+          candidateName: candidateMatch[1].trim(),
+          resumeId: candidateMatch[2] ? Number(candidateMatch[2]) : undefined,
+          skills: [],
+        },
+        role: existingCard?.role,
+        experience: existingCard?.experience,
+        educationItems: [],
+        skillsText: existingCard?.skills?.join(', ') || undefined,
+      };
+      continue;
+    }
+
+    if (!sawCandidate) {
+      introLines.push(trimmed);
+      continue;
+    }
+
+    if (!current) {
+      outroLines.push(trimmed);
+      continue;
+    }
+
+    if (/^there are \d+ more candidates/i.test(trimmed) || /^all .* are already shown/i.test(trimmed)) {
+      flushCurrent();
+      outroLines.push(trimmed);
+      continue;
+    }
+
+    if (/^-\s*role:/i.test(trimmed)) {
+      current.role = trimmed.replace(/^-\s*role:\s*/i, '').trim();
+      inEducation = false;
+      continue;
+    }
+
+    if (/^-\s*experience:/i.test(trimmed)) {
+      current.experience = trimmed.replace(/^-\s*experience:\s*/i, '').trim();
+      inEducation = false;
+      continue;
+    }
+
+    if (/^-\s*education:\s*$/i.test(trimmed)) {
+      inEducation = true;
+      continue;
+    }
+
+    const educationInlineMatch = trimmed.match(/^-\s*education:\s*(.+)$/i);
+    if (educationInlineMatch) {
+      const value = educationInlineMatch[1].trim();
+      current.educationItems = value && value !== 'N/A' ? [value] : [];
+      inEducation = false;
+      continue;
+    }
+
+    if (inEducation && /^-\s+/.test(trimmed)) {
+      current.educationItems.push(trimmed.replace(/^-\s+/, '').trim());
+      continue;
+    }
+
+    if (/^-\s*skills:/i.test(trimmed)) {
+      current.skillsText = trimmed.replace(/^-\s*skills:\s*/i, '').trim();
+      inEducation = false;
+      continue;
+    }
+
+    if (/^-\s*(photo url|profile url):/i.test(trimmed)) {
+      continue;
+    }
+
+    if (inEducation) {
+      inEducation = false;
+    }
+  }
+
+  flushCurrent();
+
+  return {
+    intro: introLines.join('\n').trim(),
+    candidates,
+    outro: outroLines.join('\n').trim(),
+  };
+}
+
 function ResumeInlineAnswer({ content, cards }: { content: string; cards: ParsedResumeCard[] }) {
   const sanitizedContent = sanitizeResumeAnswerContent(content);
   const { intro, sections } = parseResumeSections(sanitizedContent);
@@ -475,6 +610,100 @@ function ResumeInlineAnswer({ content, cards }: { content: string; cards: Parsed
             </section>
           ))}
         </div>
+      </div>
+    );
+  }
+
+  const candidateBlocks = parseResumeCandidateBlocks(sanitizedContent, cards);
+  if (candidateBlocks.candidates.length > 0) {
+    return (
+      <div className="space-y-5">
+        {candidateBlocks.intro && (
+          <div className="prose prose-slate prose-sm max-w-none text-[15px] leading-relaxed">
+            <MarkdownRenderer content={candidateBlocks.intro} />
+          </div>
+        )}
+
+        <div className="space-y-6">
+          {candidateBlocks.candidates.map((block, index) => {
+            const card = block.card;
+            const profileUrl = card.profileUrl || (card.resumeId ? `/resumes/${card.resumeId}` : undefined);
+            const skillsText = block.skillsText || (card.skills.length > 0 ? card.skills.join(', ') : 'N/A');
+
+            return (
+              <div key={`${card.resumeId || card.candidateName}-${index}`} className="space-y-3">
+                <div className="ai-inline-person not-prose flex items-center gap-3 rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm animate-in fade-in slide-in-from-left-2 duration-500">
+                  <div className="w-2 h-2 rounded-full bg-violet-500 shrink-0" />
+                  <div className="w-11 h-11 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center overflow-hidden shrink-0 shadow-sm">
+                    {card.photoUrl ? (
+                      <img src={card.photoUrl} alt="" className="w-full h-full object-cover" />
+                    ) : (
+                      <Users className="w-4 h-4 text-slate-400" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[15px] font-black text-slate-900 tracking-tight">{card.candidateName}</span>
+                      {card.resumeId && (
+                        <span className="text-[12px] font-semibold text-slate-500">(ID: {card.resumeId})</span>
+                      )}
+                    </div>
+                    <div className="mt-1 text-[11px] font-semibold text-slate-500">
+                      {block.role || card.role || 'Personnel Profile'}
+                      {(block.experience || card.experience) ? ` | ${block.experience || card.experience}` : ''}
+                    </div>
+                  </div>
+                  {profileUrl && (
+                    <Link
+                      to={profileUrl}
+                      className="inline-flex items-center gap-1.5 text-[9px] text-violet-600 font-black hover:bg-violet-600 hover:text-white transition-all bg-violet-50 px-3 py-2 rounded-xl border border-violet-100 uppercase tracking-wider shadow-sm shrink-0"
+                    >
+                      Profile <ExternalLink className="w-2.5 h-2.5" />
+                    </Link>
+                  )}
+                </div>
+
+                <ul className="not-prose space-y-2 pl-6 text-[15px] leading-relaxed text-slate-100/95">
+                  <li className="flex items-start gap-3">
+                    <span className="mt-2 h-2 w-2 rounded-full bg-violet-500 shrink-0" />
+                    <span><strong className="text-white">Role:</strong> {block.role || card.role || 'N/A'}</span>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="mt-2 h-2 w-2 rounded-full bg-violet-500 shrink-0" />
+                    <span><strong className="text-white">Experience:</strong> {block.experience || card.experience || 'N/A'}</span>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="mt-2 h-2 w-2 rounded-full bg-violet-500 shrink-0" />
+                    <div className="space-y-1">
+                      <span><strong className="text-white">Education:</strong></span>
+                      {block.educationItems.length > 0 ? (
+                        <ul className="space-y-1 pl-5">
+                          {block.educationItems.map((item, itemIndex) => (
+                            <li key={`${card.resumeId || card.candidateName}-edu-${itemIndex}`} className="list-disc marker:text-violet-400">
+                              {item}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <div>N/A</div>
+                      )}
+                    </div>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="mt-2 h-2 w-2 rounded-full bg-violet-500 shrink-0" />
+                    <span><strong className="text-white">Skills:</strong> {skillsText}</span>
+                  </li>
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+
+        {candidateBlocks.outro && (
+          <div className="prose prose-slate prose-sm max-w-none text-[15px] leading-relaxed">
+            <MarkdownRenderer content={candidateBlocks.outro} />
+          </div>
+        )}
       </div>
     );
   }
