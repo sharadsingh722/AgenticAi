@@ -5,6 +5,7 @@ import hashlib
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import load_only
 
 from app.database import get_db
 from app.models import Resume
@@ -238,7 +239,27 @@ async def upload_resumes_batch(
 @router.get("", response_model=list[ResumeResponse])
 async def list_resumes(db: Session = Depends(get_db)):
     """List all resumes."""
-    resumes = db.query(Resume).order_by(Resume.created_at.desc()).all()
+    resumes = (
+        db.query(Resume)
+        .options(
+            load_only(
+                Resume.id,
+                Resume.name,
+                Resume.email,
+                Resume.phone,
+                Resume.skills,
+                Resume.total_years_experience,
+                Resume.domain_expertise,
+                Resume.file_name,
+                Resume.photo_filename,
+                Resume.pdf_filename,
+                Resume.parse_status,
+                Resume.created_at,
+            )
+        )
+        .order_by(Resume.created_at.desc())
+        .all()
+    )
     return [_resume_to_response(r) for r in resumes]
 
 

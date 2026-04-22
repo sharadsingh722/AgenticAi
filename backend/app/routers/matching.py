@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import load_only
 
 from app.database import get_db
 from app.models import Tender, MatchResult, Resume
@@ -67,22 +68,6 @@ async def run_matching(tender_id: int, db: Session = Depends(get_db)):
                 "error": None,
             }
 
-            # Wait, rather than loading ALL resumes and filtering later,
-            # we will only load the ones pre-filtered plus whatever the fallback loads.
-            # But the fallback logic is in `pre_filter(state)` node.
-            # It's better to just build the lookup for all successful resumes to avoid multiple trips. 
-            # (In production with 10kumes this is bad, but keeping original flow mostly intact).
-            all_resumes = db.query(Resume).filter(Resume.parse_status == "success").all()
-            resume_lookup = {}
-            for r in all_resumes:
-                parsed = json.loads(r.parsed_data) if r.parsed_data else {}
-                resume_lookup[r.id] = {
-                    "resume_id": r.id,
-                    "parsed_data": parsed,
-                    "name": r.name,
-                    "photo_filename": r.photo_filename,
-                }
-
             # Run agent nodes manually so we can inject data between steps
             # Step 1: Determine criteria
             state.update(determine_criteria(state))
@@ -91,6 +76,24 @@ async def run_matching(tender_id: int, db: Session = Depends(get_db)):
             state.update(pre_filter(state))
 
             # Step 3: Inject full resume data for candidates
+            candidate_ids = [c["resume_id"] for c in state.get("candidate_resumes", [])]
+            resume_lookup = {}
+            if candidate_ids:
+                candidate_rows = (
+                    db.query(Resume)
+                    .options(load_only(Resume.id, Resume.name, Resume.photo_filename, Resume.parsed_data))
+                    .filter(Resume.id.in_(candidate_ids))
+                    .all()
+                )
+                for resume in candidate_rows:
+                    parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
+                    resume_lookup[resume.id] = {
+                        "resume_id": resume.id,
+                        "parsed_data": parsed,
+                        "name": resume.name,
+                        "photo_filename": resume.photo_filename,
+                    }
+
             enriched = []
             for c in state.get("candidate_resumes", []):
                 rid = c["resume_id"]
@@ -234,17 +237,28 @@ async def get_match_results(
 
     roles_data = json.loads(tender.required_roles) if tender.required_roles else []
     roles_by_title = {r.get("role_title"): r for r in roles_data}
+    resume_ids = sorted({rec.resume_id for rec in records})
+    resumes_by_id = {}
+    if resume_ids:
+        resume_rows = (
+            db.query(Resume)
+            .options(load_only(Resume.id, Resume.name, Resume.photo_filename, Resume.parsed_data))
+            .filter(Resume.id.in_(resume_ids))
+            .all()
+        )
+        resumes_by_id = {resume.id: resume for resume in resume_rows}
 
     roles_dict = {}
     for rec in records:
         if rec.role_title not in roles_dict:
             roles_dict[rec.role_title] = []
 
-        resume = db.query(Resume).filter(Resume.id == rec.resume_id).first()
+        resume = resumes_by_id.get(rec.resume_id)
         name = resume.name if resume else "Unknown"
         designation = None
         exp_years = 0.0
         photo_url = None
+        parsed = {}
         if resume:
             parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
             exp = parsed.get("experience", [])
@@ -325,9 +339,19 @@ async def get_match_results(
 async def list_match_summaries(db: Session = Depends(get_db)):
     """List tenders with match results."""
     tender_ids = db.query(MatchResult.tender_id).distinct().all()
+    resolved_tender_ids = [tid for (tid,) in tender_ids]
+    tenders_by_id = {}
+    if resolved_tender_ids:
+        tender_rows = (
+            db.query(Tender)
+            .options(load_only(Tender.id, Tender.project_name, Tender.created_at))
+            .filter(Tender.id.in_(resolved_tender_ids))
+            .all()
+        )
+        tenders_by_id = {tender.id: tender for tender in tender_rows}
     summaries = []
-    for (tid,) in tender_ids:
-        tender = db.query(Tender).filter(Tender.id == tid).first()
+    for tid in resolved_tender_ids:
+        tender = tenders_by_id.get(tid)
         if not tender:
             continue
         roles = db.query(MatchResult.role_title).filter(MatchResult.tender_id == tid).distinct().all()

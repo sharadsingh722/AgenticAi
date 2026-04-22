@@ -5,13 +5,19 @@ import hashlib
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import load_only
 
 from app.database import get_db
 from app.models import Tender
 from app.schemas import TenderResponse, TenderDetailResponse, RequiredRole
 from app.services.pdf_parser import extract_text_from_pdf
 from app.services.llm_extractor import extract_tender_data
-from app.services.embedding import embed_texts, store_tender_role_embedding, delete_tender_embeddings
+from app.services.embedding import (
+    embed_texts,
+    store_tender_embedding,
+    store_tender_role_embedding,
+    delete_tender_embeddings,
+)
 from app.services.ingestion import process_rag_indexing
 from app.config import settings
 router = APIRouter(prefix="/tenders", tags=["tenders"])
@@ -165,7 +171,26 @@ async def upload_tender(
 @router.get("", response_model=list[TenderResponse])
 async def list_tenders(db: Session = Depends(get_db)):
     """List all tenders."""
-    tenders = db.query(Tender).order_by(Tender.created_at.desc()).all()
+    tenders = (
+        db.query(Tender)
+        .options(
+            load_only(
+                Tender.id,
+                Tender.project_name,
+                Tender.client,
+                Tender.document_reference,
+                Tender.document_date,
+                Tender.required_roles,
+                Tender.key_technologies,
+                Tender.file_name,
+                Tender.pdf_filename,
+                Tender.parse_status,
+                Tender.created_at,
+            )
+        )
+        .order_by(Tender.created_at.desc())
+        .all()
+    )
     return [_tender_to_response(t) for t in tenders]
 
 
@@ -198,8 +223,7 @@ async def download_tender_pdf(tender_id: int, db: Session = Depends(get_db)):
     if not tender or not tender.pdf_filename:
         raise HTTPException(status_code=404, detail="PDF backup not found for this tender")
 
-    import os
-    file_path = os.path.join("data", "uploads", "tenders", tender.pdf_filename)
+    file_path = os.path.join(settings.upload_dir, "tenders", tender.pdf_filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on server")
 

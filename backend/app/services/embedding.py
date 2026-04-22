@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from openai import AsyncOpenAI
 import chromadb
 from app.config import settings
@@ -53,22 +54,32 @@ tender_collection = chroma_client.get_or_create_collection(
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """Generate embeddings for a list of texts using OpenAI.
 
-    Batches in groups of 100 to respect API limits.
+    Batches in groups of 20 to respect user preference and processes them in parallel.
     """
-    all_embeddings = []
-    batch_size = 100
+    if not texts:
+        return []
+
+    batch_size = 20
+    tasks = []
+
+    async def _embed_batch(batch: list[str]):
+        # Truncate each text to avoid token limits
+        cleaned_batch = [t[:8000] for t in batch]
+        response = await openai_client.embeddings.create(
+            model=settings.embedding_model,
+            input=cleaned_batch,
+        )
+        return [item.embedding for item in response.data]
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        # Truncate each text to avoid token limits
-        batch = [t[:8000] for t in batch]
+        tasks.append(_embed_batch(batch))
 
-        response = await openai_client.embeddings.create(
-            model=settings.embedding_model,
-            input=batch,
-        )
-        all_embeddings.extend([item.embedding for item in response.data])
-
+    # Process all batches in parallel
+    results = await asyncio.gather(*tasks)
+    
+    # Flatten the results
+    all_embeddings = [emb for batch_res in results for emb in batch_res]
     return all_embeddings
 
 
@@ -253,5 +264,17 @@ def query_tender_chunks(tender_id: int, query_embedding: list[float], n_results:
     return tender_chunk_collection.query(
         query_embeddings=[query_embedding],
         where={"tender_id": tender_id},
+        n_results=n_results
+    )
+
+
+async def query_tender_chunks_keyword(tender_id: int, keyword: str, n_results: int = 5) -> dict:
+    """Surgically query chunks for a specific tender using exact keyword matching in ChromaDB."""
+    dummy_embedding = [0.0] * 1536
+
+    return tender_chunk_collection.query(
+        query_embeddings=[dummy_embedding],
+        where={"tender_id": tender_id},
+        where_document={"$contains": keyword},
         n_results=n_results
     )

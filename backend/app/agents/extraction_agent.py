@@ -166,7 +166,7 @@ def _get_master_data_context() -> str:
     db = SessionLocal()
     try:
         skills = db.query(CommonSkill).all()
-        edu = db.query(CommonEducation).all()
+        edu = [item for item in db.query(CommonEducation).all() if _is_likely_education_value(" ".join([item.name, item.aliases or ""]))]
         
         context = "### MASTER COMMON DATA (Existing entities in database)\n\n"
         
@@ -503,6 +503,107 @@ def _normalize_lookup_value(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
+_EDUCATION_POSITIVE_MARKERS = {
+    "btech", "b tech", "b.e", "be ", "bachelor", "mtech", "m tech", "m.e", "master",
+    "mca", "bca", "bsc", "msc", "mba", "phd", "doctor of philosophy", "diploma",
+    "graduate", "post graduate", "postgraduate", "amie", "secondary", "senior secondary",
+    "class x", "class xii", "10th", "12th",
+}
+
+_EDUCATION_NEGATIVE_MARKERS = {
+    "rfp", "tender", "annex", "arbitration", "approval", "amount of",
+    "account payee", "bank guarantee", "procedure", "advertisement", "consortium",
+    "liable to pay", "withdrawal of", "acknowledg", "submitted along", "submission of",
+    "compliance", "bidder", "online submission", "application form",
+}
+
+
+def _clean_education_raw_value(raw_value: str) -> str:
+    value = str(raw_value or "")
+    value = re.sub(r"https?://\S+", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:download|file|view|photo|resume|page)\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:sgpa|cgpa|percentage)\s*[:\-]?\s*[\d.]+\s*(?:/\s*10|/\s*100|%)?", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b\d{5,}\b", " ", value)
+    value = re.sub(r"\s+\|\s+", " | ", value)
+    value = re.sub(r"\s+", " ", value).strip(" ,.-|")
+    return value
+
+
+def _is_likely_education_value(raw_value: str) -> bool:
+    cleaned = _clean_education_raw_value(raw_value).lower()
+    if not cleaned:
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", cleaned).strip()
+    if any(marker in normalized for marker in _EDUCATION_NEGATIVE_MARKERS):
+        return False
+    return any(marker in normalized for marker in _EDUCATION_POSITIVE_MARKERS)
+
+
+def _derive_education_key(raw_value: str) -> str:
+    cleaned = _clean_education_raw_value(raw_value)
+    lowered = cleaned.lower()
+
+    degree = None
+    subject = None
+
+    degree_patterns = [
+        (r"\bamie\b", "amie"),
+        (r"\bph\.?\s*d\b|\bdoctor of philosophy\b", "phd"),
+        (r"\bm\.?\s*tech\b|\bmaster of technology\b", "mtech"),
+        (r"\bm\.?\s*e\b|\bmaster of engineering\b", "mtech"),
+        (r"\bb\.?\s*tech\b|\bbachelor of technology\b", "btech"),
+        (r"\bb\.?\s*e\b|\bbachelor of engineering\b", "btech"),
+        (r"\bmca\b|\bmaster of computer applications\b", "mca"),
+        (r"\bbca\b|\bbachelor of computer applications\b", "bca"),
+        (r"\bm\.?\s*sc\b|\bmaster of science\b", "msc"),
+        (r"\bb\.?\s*sc\b|\bbachelor of science\b", "bsc"),
+        (r"\bmba\b|\bmaster of business administration\b", "mba"),
+        (r"\bdiploma\b", "diploma"),
+        (r"\bsenior secondary\b|\bclass xii\b|\b12th\b", "12th"),
+        (r"\bsecondary\b|\bclass x\b|\b10th\b", "10th"),
+        (r"\bpost graduate\b|\bpostgraduate\b", "postgraduate"),
+        (r"\bgraduate\b|\bdegree\b", "graduate"),
+    ]
+    for pattern, label in degree_patterns:
+        if re.search(pattern, lowered, re.IGNORECASE):
+            degree = label
+            break
+
+    subject_patterns = [
+        (r"\bcivil\b", "civil"),
+        (r"\bstructural\b", "structural"),
+        (r"\bcomputer science\b", "computer_science"),
+        (r"\bcomputer applications\b", "computer_applications"),
+        (r"\bgeology\b", "geology"),
+        (r"\benvironmental\b", "environmental"),
+        (r"\bmechanical\b", "mechanical"),
+        (r"\belectrical\b", "electrical"),
+        (r"\belectronics\b", "electronics"),
+        (r"\bbusiness administration\b", "business_administration"),
+    ]
+    for pattern, label in subject_patterns:
+        if re.search(pattern, lowered, re.IGNORECASE):
+            subject = label
+            break
+
+    if degree == "graduate" and "engineering" in lowered and not subject:
+        degree = "btech"
+    if degree == "postgraduate" and "engineering" in lowered and not subject:
+        degree = "mtech"
+    if degree == "graduate" and "computer applications" in lowered:
+        degree = "bca"
+    if degree == "postgraduate" and "computer applications" in lowered:
+        degree = "mca"
+
+    key_parts = [part for part in [degree, subject] if part]
+    if not key_parts:
+        key_parts = [re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")]
+
+    normalized_key = "_".join(key_parts)
+    normalized_key = re.sub(r"_+", "_", normalized_key).strip("_")
+    return normalized_key[:120] if normalized_key else "other_qualification"
+
+
 def resolve_with_common_table_engine(category: str, raw_values: list[str], common_entries: list, db) -> dict:
     """
     Common Table Engine:
@@ -525,6 +626,12 @@ def resolve_with_common_table_engine(category: str, raw_values: list[str], commo
         else:
             raw_value = str(raw_value)
 
+        if category == "education":
+            raw_value = _clean_education_raw_value(raw_value)
+            if not _is_likely_education_value(raw_value):
+                logger.info("Skipping non-education value during common-table resolution: %s", raw_value)
+                continue
+
         normalized_raw = _normalize_lookup_value(raw_value)
         if not normalized_raw:
             continue
@@ -532,6 +639,8 @@ def resolve_with_common_table_engine(category: str, raw_values: list[str], commo
         best_name = None
         best_score = 0
         for entry in common_entries:
+            if category == "education" and not _is_likely_education_value(" ".join([entry.name, entry.aliases or ""])):
+                continue
             aliases = json.loads(entry.aliases) if entry.aliases else []
             candidates = [entry.name, *aliases]
             for candidate in candidates:
@@ -580,19 +689,21 @@ def resolve_with_common_table_engine(category: str, raw_values: list[str], commo
                     db.flush()
         else:
             # NO Match -> AI normalizes
-            prompt = RESUME_NORMALIZER_PROMPT.format(category=category, raw_value=raw_value)
-            try:
-                result = llm.invoke([HumanMessage(content=prompt)])
-                normalized_key = result.content.strip()
-                # Clean accidental quotes or code blocks
-                if normalized_key.startswith("```"):
-                    normalized_key = normalized_key.split("\n", 1)[-1].split("```")[0].strip()
-                normalized_key = re.sub(r"[^a-z0-9_]", "", normalized_key.lower()).strip("_")
-                if not normalized_key:
+            if category == "education":
+                normalized_key = _derive_education_key(raw_value)
+            else:
+                prompt = RESUME_NORMALIZER_PROMPT.format(category=category, raw_value=raw_value)
+                try:
+                    result = llm.invoke([HumanMessage(content=prompt)])
+                    normalized_key = result.content.strip()
+                    if normalized_key.startswith("```"):
+                        normalized_key = normalized_key.split("\n", 1)[-1].split("```")[0].strip()
+                    normalized_key = re.sub(r"[^a-z0-9_]", "", normalized_key.lower()).strip("_")
+                    if not normalized_key:
+                        normalized_key = re.sub(r"[^a-z0-9]+", "_", raw_value.lower()).strip("_")
+                except Exception as e:
+                    logger.warning(f"AI Normalization failed for '{raw_value}': {e}")
                     normalized_key = re.sub(r"[^a-z0-9]+", "_", raw_value.lower()).strip("_")
-            except Exception as e:
-                logger.warning(f"AI Normalization failed for '{raw_value}': {e}")
-                normalized_key = re.sub(r"[^a-z0-9]+", "_", raw_value.lower()).strip("_")
 
             # Validate generated key doesn't clash with an existing one by chance
             entry = next((e for e in common_entries if e.name == normalized_key), None)
@@ -618,11 +729,29 @@ def resolve_with_common_table_engine(category: str, raw_values: list[str], commo
 _VALID_EDU_LEVELS = {"graduate", "postgraduate", "phd", "diploma", "highschool", "other"}
 
 
+def _heuristic_classify_education_level(raw_value: str) -> str:
+    lowered = (raw_value or "").lower()
+    if any(token in lowered for token in ["phd", "doctor of philosophy", "doctorate", "doctoral"]):
+        return "phd"
+    if any(token in lowered for token in ["mtech", "m.tech", "master", "mba", "mca", "msc", "m.e", "post graduate", "postgraduate"]):
+        return "postgraduate"
+    if any(token in lowered for token in ["btech", "b.tech", "bachelor", "bca", "bsc", "ba", "bba", "amie", "graduate", "degree"]):
+        return "graduate"
+    if "diploma" in lowered:
+        return "diploma"
+    if any(token in lowered for token in ["10th", "12th", "secondary", "senior secondary", "class x", "class xii"]):
+        return "highschool"
+    return "other"
+
+
 def _classify_education_level(raw_value: str) -> str:
     """Classify a human-readable education/degree string into a canonical level.
     Uses fast LLM. Called once at extraction time from the readable raw_value."""
     if not raw_value or not raw_value.strip():
         return "other"
+    heuristic_level = _heuristic_classify_education_level(raw_value)
+    if heuristic_level != "other":
+        return heuristic_level
     llm = get_fast_llm()
     prompt = (
         f"Classify this academic qualification into exactly one category.\n\n"

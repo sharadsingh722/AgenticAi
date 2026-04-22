@@ -15,10 +15,71 @@ from app.services.llm import get_reasoning_llm
 
 logger = logging.getLogger(__name__)
 
+EDUCATION_LEVEL_EQUIVALENTS = {
+    "graduate": {"graduate", "undergraduate", "bachelor", "bachelors", "graduation", "degree"},
+    "postgraduate": {"postgraduate", "post", "master", "masters", "pg", "postgraduation", "post_graduation"},
+    "phd": {"phd", "doctorate", "doctoral", "doctor"},
+    "diploma": {"diploma", "polytechnic"},
+    "highschool": {"highschool", "school", "10th", "12th", "secondary", "senior_secondary", "intermediate"},
+}
+
+EDUCATION_LEVEL_SUPERSETS = {
+    "graduate": {"graduate", "level_graduate_and_postgraduate"},
+    "postgraduate": {"postgraduate", "level_graduate_and_postgraduate"},
+    "phd": {"phd"},
+    "diploma": {"diploma"},
+    "highschool": {"highschool"},
+}
+
+EDUCATION_CANONICAL_TOKEN_MAP = {
+    "btech": {"btech", "b tech", "b.tech", "bachelor_engineering", "bachelor of technology", "engineering"},
+    "be": {"be", "b.e", "b e", "bachelor_engineering", "engineering"},
+    "bachelor": {"bachelor", "bachelors", "graduate", "graduation", "degree"},
+    "mtech": {"mtech", "m tech", "m.tech", "master_engineering", "master of technology", "engineering"},
+    "me": {"me", "m.e", "m e", "master_engineering", "engineering"},
+    "master": {"master", "masters", "postgraduate", "post graduation", "pg"},
+    "phd": {"phd", "doctorate", "doctoral", "doctor of philosophy"},
+    "mca": {"mca", "master of computer applications", "computer applications"},
+    "bca": {"bca", "bachelor of computer applications", "computer applications"},
+    "bsc": {"bsc", "b.sc", "b sc", "bachelor of science", "science"},
+    "msc": {"msc", "m.sc", "m sc", "master of science", "science"},
+    "amie": {"amie", "associate member of institution of engineers", "engineering"},
+    "civil": {"civil", "civil engineering"},
+    "structural": {"structural", "structural engineering"},
+    "computer": {"computer", "computer science", "computer applications"},
+    "geology": {"geology", "geological"},
+    "environmental": {"environmental", "environment"},
+}
+
+EDUCATION_STOPWORDS = {
+    "candidate", "candidates", "find", "show", "list", "all", "who", "with", "having", "resume",
+    "resumes", "qualification", "qualifications", "degree", "degrees", "need", "looking", "for",
+    "vs", "or", "and", "in", "of", "the", "please", "give", "me", "from", "done", "completed",
+    "complete", "finished", "have", "has",
+}
+
+DOMAIN_HINT_TERMS = {
+    "railway", "metro", "highway", "road", "bridge", "tunnel", "epc", "infrastructure",
+    "construction", "civil", "telecom", "power", "it", "software", "gis", "drone",
+    "survey", "design", "government", "psu", "nhai",
+}
+
 
 class CommonValueSelection(BaseModel):
     selected_common_values: list[str] = Field(default_factory=list)
     reasoning: str = ""
+
+
+class ResumeQueryInterpretation(BaseModel):
+    original_query: str
+    experience_operator: Optional[str] = None
+    experience_value: Optional[float] = None
+    experience_upper_value: Optional[float] = None
+    education_query: Optional[str] = None
+    skill_queries: list[str] = Field(default_factory=list)
+    excluded_skill_queries: list[str] = Field(default_factory=list)
+    domain_query: Optional[str] = None
+    intent_notes: list[str] = Field(default_factory=list)
 
 
 def _unique_preserve(values: list[str]) -> list[str]:
@@ -40,6 +101,14 @@ def _normalize_lookup_text(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9\s]+", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _normalized_contains_phrase(text: str, phrase: str) -> bool:
+    normalized_text = _normalize_lookup_text(text)
+    normalized_phrase = _normalize_lookup_text(phrase)
+    if not normalized_text or not normalized_phrase:
+        return False
+    return normalized_phrase in normalized_text
 
 
 def _tokenize_lookup_text(value: str) -> list[str]:
@@ -131,17 +200,131 @@ def _contains_normalized_marker(normalized_text: str, marker: str) -> bool:
     return bool(compact_marker) and compact_marker in compact_text
 
 
+def _education_semantic_terms(user_query: str) -> set[str]:
+    raw_query = user_query or ""
+    normalized = _normalize_lookup_text(user_query)
+    terms = set(_tokenize_lookup_text(user_query))
+    phrase_checks = [
+        (r"\bb\.?\s*tech\b|\bbachelor of technology\b", "btech"),
+        (r"\bbachelor of engineering\b", "be"),
+        (r"\bm\.?\s*tech\b|\bmaster of technology\b", "mtech"),
+        (r"\bmaster of engineering\b", "me"),
+        (r"\bb\.?\s*c\.?\s*a\b|\bbachelor of computer applications\b", "bca"),
+        (r"\bm\.?\s*c\.?\s*a\b|\bmaster of computer applications\b", "mca"),
+        (r"\bb\.?\s*sc\b|\bb\.?\s*s\.?\s*c\b|\bbachelor of science\b", "bsc"),
+        (r"\bm\.?\s*sc\b|\bm\.?\s*s\.?\s*c\b|\bmaster of science\b", "msc"),
+        (r"\bamie\b|\bassociate member of institution of engineers\b", "amie"),
+        (r"\bph\.?\s*d\b|\bdoctorate\b|\bdoctoral\b|\bdoctor of philosophy\b", "phd"),
+    ]
+
+    for pattern, key in phrase_checks:
+        if re.search(pattern, raw_query, re.IGNORECASE):
+            terms.update(EDUCATION_CANONICAL_TOKEN_MAP[key])
+
+    be_context_pattern = r"\bb\.?\s*e\b(?=(?:\s+(?:in\s+)?)?(?:civil|mechanical|electrical|electronics|computer|chemical|structural|engineering)\b|[,\-/]|$)"
+    me_context_pattern = r"\bm\.?\s*e\b(?=(?:\s+(?:in\s+)?)?(?:civil|mechanical|electrical|electronics|computer|chemical|structural|engineering)\b|[,\-/]|$)"
+    if re.search(be_context_pattern, raw_query, re.IGNORECASE):
+        terms.update(EDUCATION_CANONICAL_TOKEN_MAP["be"])
+    if re.search(me_context_pattern, raw_query, re.IGNORECASE):
+        terms.update(EDUCATION_CANONICAL_TOKEN_MAP["me"])
+
+    if "eng" in terms or "engg" in terms:
+        terms.update({"engineering"})
+
+    if "post graduation" in normalized or "post graduate" in normalized:
+        terms.update({"postgraduation", "postgraduate", "master", "masters", "pg"})
+    if "under graduate" in normalized or "undergraduate" in normalized:
+        terms.update({"graduate", "bachelor", "bachelors"})
+
+    return {term for term in terms if term}
+
+
+def _extract_subject_terms_from_semantics(semantic_terms: set[str]) -> set[str]:
+    subject_terms = set()
+    level_terms = set().union(*EDUCATION_LEVEL_EQUIVALENTS.values())
+    for term in semantic_terms:
+        if term in EDUCATION_STOPWORDS or term in level_terms:
+            continue
+        if term in {"engineering", "science", "computer", "applications"}:
+            subject_terms.add(term)
+            continue
+        if len(term) > 2:
+            subject_terms.add(term)
+    return subject_terms
+
+
+def _is_meaningful_education_item(item: dict) -> bool:
+    item_level = (item.get("level") or "other").lower()
+    combined = _normalize_lookup_text(" ".join([
+        item.get("name", ""),
+        item.get("display_label", ""),
+        *item.get("aliases", []),
+    ]))
+    if not combined:
+        return False
+
+    quality_markers = {
+        "bachelor", "master", "phd", "doctorate", "diploma", "amie", "mca", "bca",
+        "bsc", "msc", "btech", "mtech", "secondary", "10th", "12th",
+    }
+    if not any(marker in combined for marker in quality_markers):
+        return False
+
+    return item_level in {"graduate", "postgraduate", "phd", "diploma", "highschool", "level_graduate_and_postgraduate", "other"}
+
+
 def _education_query_constraints(user_query: str) -> dict:
-    """Infer constraints for education queries. Simplified to rely on AI resolution."""
+    """Infer normalized education constraints from a free-form query."""
+    normalized = _normalize_lookup_text(user_query)
+    semantic_terms = _education_semantic_terms(user_query)
+    levels = set()
+    if "post graduation" in normalized or "post graduate" in normalized or "postgraduation" in normalized:
+        levels.add("postgraduate")
+    else:
+        levels = {
+            level
+            for level, synonyms in EDUCATION_LEVEL_EQUIVALENTS.items()
+            if semantic_terms & synonyms
+        }
+    has_subject_constraint = any(
+        token not in EDUCATION_STOPWORDS and
+        all(token not in synonyms for synonyms in EDUCATION_LEVEL_EQUIVALENTS.values())
+        for token in semantic_terms
+    )
     return {
-        "normalized": _normalize_lookup_text(user_query),
-        "semantic_terms": set(_tokenize_lookup_text(user_query)),
+        "normalized": normalized,
+        "semantic_terms": semantic_terms,
+        "levels": levels,
+        "subject_terms": _extract_subject_terms_from_semantics(semantic_terms),
+        "has_subject_constraint": has_subject_constraint,
     }
 
 
 def _item_matches_education_constraints(item: dict, constraints: dict) -> bool:
-    """Check if a catalog item matches the user query. Defer to AI resolution for complexity."""
-    return True # Allow everything into the LLM context for final decision.
+    """Check if a catalog education entry matches the inferred user constraints."""
+    if not _is_meaningful_education_item(item):
+        return False
+
+    levels = constraints.get("levels", set())
+    if levels:
+        item_level = (item.get("level") or "other").lower()
+        if not any(item_level in EDUCATION_LEVEL_SUPERSETS.get(level, {level}) for level in levels):
+            return False
+
+    subject_terms = constraints.get("subject_terms", set())
+    if not subject_terms:
+        return True
+
+    item_semantics = _education_semantic_terms(" ".join([
+        item.get("name", ""),
+        item.get("display_label", ""),
+        *item.get("aliases", []),
+        *item.get("search_terms", []),
+    ]))
+    specific_subject_terms = subject_terms - {"engineering", "science", "computer", "applications"}
+    if specific_subject_terms:
+        return bool(specific_subject_terms & item_semantics)
+    return bool(subject_terms & item_semantics)
 
 
 def _build_search_terms(category: str, name: str, aliases: list[str]) -> list[str]:
@@ -192,6 +375,7 @@ def _load_common_items(db, category: str) -> list[dict]:
             "name": item.name,
             "aliases": aliases,
             "search_terms": search_terms,
+            "concepts": search_terms,
             "display_label": _best_display_label(item.name, aliases, search_terms),
         }
         if hasattr(item, "level"):
@@ -243,106 +427,49 @@ def _resolve_common_values(category: str, user_query: str, items: list[dict]) ->
     if not user_query.strip() or not items:
         return []
 
-    llm = get_reasoning_llm().with_structured_output(CommonValueSelection)
-    filtered_items = []
-    catalog_lines = []
-    for item in items:
-        # Loosened pre-filter: Only skip if there's a clear, extreme mismatch (e.g. wrong level)
-        # But for dev/small-db, we prefer showing MORE to the LLM to ensure dynamism.
-        filtered_items.append(item)
-        aliases = ", ".join(item["aliases"]) if item["aliases"] else "none"
-        search_terms = ", ".join(item.get("search_terms", [])[:5]) if item.get("search_terms") else "none"
-        level_part = f" | level: {item['level']}" if item.get("level") else ""
-        catalog_lines.append(
-            f"- {item['name']} | label: {item.get('display_label', item['name'])}{level_part} | concepts: {search_terms} | aliases: {aliases}"
-        )
-
-    if not catalog_lines:
-        return []
-
+    filtered_items = items
     if category == "education":
+        filtered_items = [item for item in items if _is_meaningful_education_item(item)]
         exact_matches = _catalog_exact_matches(category, user_query, filtered_items)
         if exact_matches:
             return exact_matches
-    
-    # Phase 1: Use AI to extract structured requirements (Level & Subject) from the user query
-    # This keeps the "intelligence" dynamic without hardcoding degree names.
-    extraction_prompt = (
-        "You are an academic requirements analyst.\n"
-        f"User Query: \"{user_query}\"\n\n"
-        "Identify the core requirements:\n"
-        "1. Academic Level: One of [graduate, postgraduate, phd, diploma] or null if not specified.\n"
-        "2. Subject/Domain: The specific field of study (e.g. 'Civil Engineering') or null if not specified.\n"
-        "3. Explicit Degrees: Any specific degree names mentioned (e.g. 'BTech').\n\n"
-        "Return the analysis as JSON."
-    )
-    
-    # We use a simpler, faster reasoning approach for extraction or reuse the LLM
-    try:
-        # Re-using the same LLM but with a custom structured output if needed
-        # For brevity, let's assume we can derive the requirement specs.
-        # But to be REALLY dynamic and robust, I'll use the LLM to select from the metadata-rich catalog
-        # with a REVERSE instruction: "Select every entry whose METADATA Level matches the query intent."
-        
-        # Actually, let's just fix the prompt to be EXTREMELY explicit about the Selection Protocol.
-        pass
-    except:
-        pass
 
-    # REFINED AI PROMTP (The "registrar" approach)
-    catalog_lines = []
-    for item in items:
-        name = item.get("name")
-        if not name: continue
-        level = item.get("level", "N/A")
-        catalog_lines.append(f"- {name} (Technical Metadata Level: {level} | Concepts: {', '.join(item.get('concepts', []))})")
+        constraints = _education_query_constraints(user_query)
+        scored_matches = []
+        for item in filtered_items:
+            if not _item_matches_education_constraints(item, constraints):
+                continue
 
-    catalog_text = "\n".join(catalog_lines)
-    # Fetch unique levels present in the catalog for dynamic discoverability
-    available_levels = sorted(list(set(item.get("level", "other") for item in items if item.get("level"))))
-    
-    prompt = (
-        "You are an Academic Registrar standardizing search filters against a degree catalog.\n\n"
-        f"User Filter: \"{user_query}\"\n"
-        f"Catalog:\n{catalog_text}\n\n"
-        f"AVAILABLE TECHNICAL LEVELS: {', '.join(available_levels)}\n\n"
-        "SELECTION RULES (MANDATORY):\n"
-        "1. DUAL-LEVEL RULE (PRIORITY): The level 'level_graduate_and_postgraduate' is a SUPERSET. You MUST select every entry with this level if the user is looking for EITHER 'graduate' level (Bachelors) OR 'postgraduate' level (Masters). This is non-negotiable for Integrated/Dual degrees.\n"
-        "2. LEVEL DISCOVERY: Semantically identify the intended level from the user query. \n"
-        "   - 'Graduation', 'Bachelors', 'Degree' -> graduate\n"
-        "   - 'Masters', 'PG', 'Post Graduation' -> postgraduate\n"
-        "3. SELECT EVERY IDENTIFIER where the 'Technical Metadata Level' matches the discovered intent.\n"
-        "4. SUBJECT RULE: If a subject (e.g. 'Civil') is mentioned, select only those that match BOTH the level intent (or dual-level) AND the subject.\n"
-        "5. Output: Return ONLY the list of matching technical identifiers (names)."
-    )
-    
-    try:
-        result = llm.invoke(prompt)
-        selected = [value for value in result.selected_common_values if any(value == item["name"] for item in items)]
-    except Exception as exc:
-        logger.warning("LLM common-value resolution failed: %s", exc)
-        selected = []
+            item_text = " ".join([
+                item.get("name", ""),
+                item.get("display_label", ""),
+                *item.get("aliases", []),
+                *item.get("search_terms", []),
+            ])
+            item_semantics = _education_semantic_terms(item_text)
+            score = 0
 
-    if not selected:
-        selected = _fallback_resolve_common_values(category, user_query, items)
+            for level in constraints["levels"]:
+                if (item.get("level") or "other").lower() in EDUCATION_LEVEL_SUPERSETS.get(level, {level}):
+                    score += 5
 
-    # HITL: Detect if the result is still too broad or ambiguous for a precise search
-    if len(selected) > 5 or (not selected and items):
-        # Generate choices for the agent to present to the user
-        vague_terms = {"masters", "degree", "graduation", "post graduation", "postgraduation", "engineering", "bachelors"}
-        if user_query.lower() in vague_terms or not selected:
-            choices = []
-            # Take a few top items or items related to the level if inferred
-            limit = 6
-            for item in items[:limit]:
-                label = item.get("display_label", item["name"])
-                choices.append(f"[[CHOICE: {label} | {item['name']} ]]")
-            
-            choice_str = " ".join(choices)
-            logger.info("HITL triggered for %s. Choices: %s", category, choice_str)
-            # We return this special string which the tool-calling logic will pass to the agent
-            return [f"HITL_CHOICES: {choice_str}"]
+            subject_overlap = constraints["subject_terms"] & item_semantics
+            score += len(subject_overlap) * 3
 
+            if constraints["normalized"] and constraints["normalized"] in _normalize_lookup_text(item_text):
+                score += 4
+
+            exact_term_overlap = constraints["semantic_terms"] & item_semantics
+            score += min(len(exact_term_overlap), 4)
+
+            scored_matches.append((score, item["name"]))
+
+        scored_matches.sort(key=lambda pair: (-pair[0], pair[1]))
+        selected = _unique_preserve([name for score, name in scored_matches if score > 0])
+        if selected:
+            return selected[:50]
+
+    selected = _fallback_resolve_common_values(category, user_query, filtered_items)
     return selected
 
 
@@ -361,11 +488,18 @@ def _education_raw_query_patterns(user_query: str) -> list[str]:
     if normalized:
         add(user_query, normalized, normalized.replace(" ", "."))
 
-    # Dynamically handle other subject/family synonyms
-    # We use the generic semantic terms to broaden the search
     for subject in semantic_terms:
         if subject not in {"graduate", "postgraduate", "engineering"}:
-             add(subject.replace("_", " "))
+            add(subject.replace("_", " "))
+
+    if {"btech", "b tech", "b.tech", "bachelor of technology"} & semantic_terms:
+        add("b.tech", "b tech", "bachelor of technology")
+    if {"mtech", "m tech", "m.tech", "master of technology"} & semantic_terms:
+        add("m.tech", "m tech", "master of technology")
+    if {"graduate", "bachelor", "bachelors", "graduation"} & semantic_terms:
+        add("graduate", "bachelor", "bachelors", "graduation")
+    if {"master", "masters", "postgraduate", "postgraduation"} & semantic_terms:
+        add("master", "masters", "post graduation", "postgraduate")
 
     return patterns
 
@@ -374,9 +508,9 @@ def _infer_education_level_from_terms(item_terms: set[str]) -> str:
     """Prioritize more advanced degrees over lower ones."""
     if "phd" in item_terms or "doctorate" in item_terms:
         return "phd"
-    if "postgraduate" in item_terms or "master" in item_terms or "master_engineering" in item_terms:
+    if {"postgraduate", "master", "master_engineering", "mtech", "msc", "mca"} & item_terms:
         return "postgraduate"
-    if "graduate" in item_terms or "bachelor" in item_terms or "bachelor_engineering" in item_terms:
+    if {"graduate", "bachelor", "bachelor_engineering", "btech", "bsc", "bca", "amie", "be"} & item_terms:
         return "graduate"
     if "diploma" in item_terms:
         return "diploma"
@@ -388,16 +522,22 @@ def _infer_education_level_from_terms(item_terms: set[str]) -> str:
 def _education_entry_matches_query(entry: str, user_query: str) -> bool:
     """Robust fallback for resumes with messy raw data bypassing standardization."""
     normalized_entry = _normalize_lookup_text(entry)
-    normalized_query = _normalize_lookup_text(user_query)
-    if not normalized_entry or not normalized_query:
+    if not normalized_entry:
         return False
-        
-    query_words = normalized_query.split()
-    if not query_words: return False
 
-    # Stricter check: All (or most) query words must be present
-    match_count = sum(1 for word in query_words if word in normalized_entry)
-    return (match_count / len(query_words)) >= 0.7
+    entry_terms = _education_semantic_terms(entry)
+    constraints = _education_query_constraints(user_query)
+
+    if constraints["levels"]:
+        inferred_level = _infer_education_level_from_terms(entry_terms)
+        if not any(inferred_level in EDUCATION_LEVEL_SUPERSETS.get(level, {level}) for level in constraints["levels"]):
+            return False
+
+    subject_terms = constraints["subject_terms"]
+    if subject_terms and not (subject_terms & entry_terms):
+        return False
+
+    return True
 
 
 def _resume_matches_education_query(resume: Resume, user_query: str, resolved_education: list[str]) -> bool:
@@ -410,6 +550,307 @@ def _resume_matches_education_query(resume: Resume, user_query: str, resolved_ed
         return False
 
     return any(_education_entry_matches_query(entry, user_query) for entry in raw_education_entries)
+
+
+def _resume_skill_phrases(resume: Resume) -> list[str]:
+    raw_skills = json.loads(resume.skills) if resume.skills else []
+    standardized_skills = json.loads(resume.standardized_skills) if resume.standardized_skills else []
+    parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
+    domain_expertise = json.loads(resume.domain_expertise) if resume.domain_expertise else []
+    phrases = [*raw_skills, *standardized_skills, *domain_expertise]
+    phrases.extend(parsed.get("skills", []))
+    return [str(value) for value in phrases if value]
+
+
+def _resume_domain_phrases(resume: Resume) -> list[str]:
+    phrases = json.loads(resume.domain_expertise) if resume.domain_expertise else []
+    parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
+    phrases.extend(parsed.get("domain_expertise", []))
+    experience = parsed.get("experience", [])
+    for item in experience:
+        if not isinstance(item, dict):
+            continue
+        for key in ("sector", "subsector", "role", "description"):
+            if item.get(key):
+                phrases.append(str(item[key]))
+    return [str(value) for value in phrases if value]
+
+
+def _resume_matches_skill_query(resume: Resume, skill_query: str, skill_items: list[dict]) -> bool:
+    resolved_skills = _resolve_common_values("skills", skill_query, skill_items)
+    phrases = _resume_skill_phrases(resume)
+    normalized_skill_query = _normalize_lookup_text(skill_query)
+
+    for phrase in phrases:
+        if _normalized_contains_phrase(phrase, normalized_skill_query):
+            return True
+
+    standardized_skills = json.loads(resume.standardized_skills) if resume.standardized_skills else []
+    if resolved_skills and any(skill in standardized_skills for skill in resolved_skills):
+        return True
+
+    query_tokens = set(_tokenize_lookup_text(skill_query))
+    if not query_tokens:
+        return False
+    return any(query_tokens <= set(_tokenize_lookup_text(phrase)) for phrase in phrases)
+
+
+def _resume_matches_domain_phrase(resume: Resume, domain_query: str) -> bool:
+    extracted_domain = _extract_domain_phrase(domain_query)
+    if extracted_domain:
+        domain_query = extracted_domain
+    phrases = _resume_domain_phrases(resume)
+    normalized_query = _normalize_lookup_text(domain_query)
+    query_tokens = set(_tokenize_lookup_text(domain_query))
+
+    if len(normalized_query.replace(" ", "")) <= 2:
+        compact_query = normalized_query.replace(" ", "")
+        return any(
+            compact_query in {token.replace(" ", "") for token in _tokenize_lookup_text(phrase)} or
+            compact_query in {
+                token.replace(" ", "")
+                for token in _normalize_lookup_text(phrase).split()
+            }
+            for phrase in phrases
+        )
+
+    if any(_normalized_contains_phrase(phrase, normalized_query) for phrase in phrases):
+        return True
+    return any(query_tokens <= set(_tokenize_lookup_text(phrase)) for phrase in phrases if query_tokens)
+
+
+def _extract_experience_filter(user_query: str) -> tuple[Optional[str], Optional[float], Optional[float]]:
+    normalized = _normalize_lookup_text(user_query)
+
+    between_match = re.search(
+        r"(?:between|from)\s+(\d+(?:\.\d+)?)\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)",
+        normalized,
+    )
+    if between_match:
+        return "between", float(between_match.group(1)), float(between_match.group(2))
+
+    experience_patterns = [
+        ("gt", r"(?:more than|greater than|over|above)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)"),
+        ("gte", r"(?:at least|minimum of|min(?:imum)?|not less than)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)"),
+        ("lte", r"(?:at most|up to|no more than|not more than)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)"),
+        ("lt", r"(?:less than|under|below)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)"),
+        ("eq", r"(?:exactly)\s+(\d+(?:\.\d+)?)\s+(?:years?|yrs?)"),
+        ("gte", r"(\d+(?:\.\d+)?)\s*\+\s*(?:years?|yrs?)"),
+    ]
+    for operator, pattern in experience_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return operator, float(match.group(1)), None
+
+    trailing_match = re.search(r"(\d+(?:\.\d+)?)\s+(?:years?|yrs?)\s+experience", normalized)
+    if trailing_match:
+        return "eq", float(trailing_match.group(1)), None
+    return None, None, None
+
+
+def _extract_education_phrase(user_query: str) -> Optional[str]:
+    raw_query = " ".join(user_query.split())
+    lowered = raw_query.lower()
+
+    if any(marker in lowered for marker in ["postgraduation", "post graduation", "postgraduate", "master", "masters", "pg"]):
+        return "postgraduation"
+    if any(marker in lowered for marker in ["graduation", "graduate", "undergraduate", "bachelor", "bachelors"]):
+        return "graduation"
+
+    patterns = [
+        r"(?:with|having|has)\s+([\w\s./&+-]+?)\s+background",
+        r"([\w\s./&+-]+?)\s+background",
+        r"background\s+in\s+([\w\s./&+-]+)",
+        r"education\s+in\s+([\w\s./&+-]+)",
+        r"([\w\s./&+-]+?)\s+education",
+        r"qualification\s+in\s+([\w\s./&+-]+)",
+        r"degree\s+in\s+([\w\s./&+-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_query, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip(" ,.")
+            value = re.sub(r"^(show|find|list|who are|who is|give me|candidates with|candidates having)\s+", "", value, flags=re.IGNORECASE)
+            if value:
+                return value
+
+    for marker in [
+        "btech", "b.tech", "be ", "b.e", "mtech", "m.tech", "mca", "bca", "bsc", "msc",
+        "phd", "diploma", "graduate", "graduation", "undergraduate", "bachelor", "bachelors",
+        "postgraduate", "post graduation", "master", "masters",
+        "civil engineering", "computer science", "computer applications",
+        "structural engineering", "geology", "environmental engineering", "amie",
+    ]:
+        if marker in lowered:
+            return raw_query
+    return None
+
+
+def _extract_skill_filters(user_query: str) -> tuple[list[str], list[str]]:
+    raw_query = " ".join(user_query.split())
+    includes = []
+    excludes = []
+
+    negative_patterns = [
+        r"not\s+([a-z0-9 .#+/\-]+)",
+        r"without\s+([a-z0-9 .#+/\-]+)",
+        r"excluding\s+([a-z0-9 .#+/\-]+)",
+    ]
+    for pattern in negative_patterns:
+        for match in re.finditer(pattern, raw_query, re.IGNORECASE):
+            value = match.group(1).strip(" ,.")
+            if value:
+                excludes.append(value)
+
+    positive_patterns = [
+        r"exactly\s+([a-z0-9 .#+/\-]+?)(?:\s+but\s+not|\s*$)",
+        r"with\s+([a-z0-9 .#+/\-]+?)\s+skills?",
+        r"skilled in\s+([a-z0-9 .#+/\-]+)",
+        r"experience in\s+([a-z0-9 .#+/\-]+)",
+        r"expertise in\s+([a-z0-9 .#+/\-]+)",
+        r"know(?:ledge)? of\s+([a-z0-9 .#+/\-]+)",
+    ]
+    for pattern in positive_patterns:
+        for match in re.finditer(pattern, raw_query, re.IGNORECASE):
+            value = match.group(1).strip(" ,.")
+            if value:
+                includes.append(value)
+
+    both_match = re.search(r"both\s+([a-z0-9 .#+/\-]+?)\s+and\s+([a-z0-9 .#+/\-]+)", raw_query, re.IGNORECASE)
+    if both_match:
+        includes.extend([both_match.group(1).strip(" ,."), both_match.group(2).strip(" ,.")])
+
+    for tech in ["python", "java", "sql", "power bi", "react", "survey", "design", "tunnel design", "civil engineering"]:
+        if re.search(rf"\b{re.escape(tech)}\b", raw_query, re.IGNORECASE):
+            if tech not in " ".join(includes).lower() and tech not in " ".join(excludes).lower():
+                if f"not {tech}" in raw_query.lower() or f"without {tech}" in raw_query.lower():
+                    excludes.append(tech)
+                elif "skill" in raw_query.lower() or "experience" in raw_query.lower() or "expertise" in raw_query.lower():
+                    includes.append(tech)
+
+    return _unique_preserve(includes), _unique_preserve(excludes)
+
+
+def _extract_domain_phrase(user_query: str) -> Optional[str]:
+    raw_query = " ".join(user_query.split())
+    patterns = [
+        r"(?:of|in|from)\s+([\w\s./&+-]+?)\s+domain\b",
+        r"\bdomain\s+of\s+([\w\s./&+-]+)",
+        r"\bdomain\s+in\s+([\w\s./&+-]+)",
+        r"\bindustry\s+of\s+([\w\s./&+-]+)",
+        r"\bsector\s+of\s+([\w\s./&+-]+)",
+        r"\bexperience\s+in\s+([\w\s./&+-]+?)(?:\s+(?:projects?|work|sector|industry|domain)\b|$)",
+        r"\bworked\s+on\s+([\w\s./&+-]+?)(?:\s+projects?\b|$)",
+        r"\bexposure\s+to\s+([\w\s./&+-]+?)(?:\s+(?:projects?|work|sector|industry)\b|$)",
+        r"\b(?:with|having)\s+([\w\s./&+-]+?)\s+projects?\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw_query, re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip(" ,.")
+        value = re.sub(
+            r"^(show|find|list|all|the|candidate|candidates|resume|resumes|who are|who is|give me)\s+",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip(" ,.")
+        if value:
+            return value
+    return None
+
+
+def _interpret_resume_query(user_query: str) -> ResumeQueryInterpretation:
+    experience_operator, experience_value, experience_upper = _extract_experience_filter(user_query)
+    education_query = _extract_education_phrase(user_query)
+    skill_queries, excluded_skill_queries = _extract_skill_filters(user_query)
+
+    domain_query = None
+    lowered = user_query.lower()
+    if any(marker in lowered for marker in ["domain", "industry", "sector"]):
+        domain_query = _extract_domain_phrase(user_query) or user_query
+    elif not education_query and not skill_queries:
+        extracted_domain = _extract_domain_phrase(user_query)
+        query_tokens = set(_tokenize_lookup_text(user_query))
+        if extracted_domain:
+            domain_query = extracted_domain
+        elif query_tokens & DOMAIN_HINT_TERMS:
+            domain_query = user_query
+
+    notes = []
+    if education_query and "background" in lowered:
+        notes.append("Mapped 'background' to education/qualification filter.")
+    if experience_operator == "gt":
+        notes.append("Interpreted 'more than/over/above' as strict greater-than.")
+    if experience_operator == "between":
+        notes.append("Interpreted range as inclusive between.")
+    if domain_query and not any(marker in lowered for marker in ["domain", "industry", "sector"]):
+        notes.append("Inferred an implicit domain/project-context filter from the query wording.")
+
+    return ResumeQueryInterpretation(
+        original_query=user_query,
+        experience_operator=experience_operator,
+        experience_value=experience_value,
+        experience_upper_value=experience_upper,
+        education_query=education_query,
+        skill_queries=skill_queries,
+        excluded_skill_queries=excluded_skill_queries,
+        domain_query=domain_query,
+        intent_notes=notes,
+    )
+
+
+def _domain_clause(model, term: str, param_prefix: str):
+    normalized_term = _normalize_lookup_text(term)
+    if not normalized_term:
+        return None
+    normalized_compact = normalized_term.replace(" ", "")
+    if len(normalized_compact) <= 2:
+        clause = text(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM json_each({model.__tablename__}.domain_expertise)
+                WHERE lower(replace(replace(json_each.value, '_', ' '), ' ', '')) = :{param_prefix}_exact
+            )
+            """
+        ).bindparams(**{f"{param_prefix}_exact": normalized_compact})
+        return clause
+
+    clause = text(
+        f"""
+        EXISTS (
+            SELECT 1
+            FROM json_each({model.__tablename__}.domain_expertise)
+            WHERE lower(replace(json_each.value, '_', ' ')) = :{param_prefix}_exact
+               OR lower(replace(json_each.value, '_', ' ')) LIKE :{param_prefix}_phrase
+        )
+        """
+    ).bindparams(
+        **{
+            f"{param_prefix}_exact": normalized_term,
+            f"{param_prefix}_phrase": f"%{normalized_term}%",
+        }
+    )
+    return clause
+
+
+def _matches_experience_filter(value: float, operator: Optional[str], lower: Optional[float], upper: Optional[float]) -> bool:
+    if operator is None or lower is None:
+        return True
+    if operator == "gt":
+        return value > lower
+    if operator == "gte":
+        return value >= lower
+    if operator == "lt":
+        return value < lower
+    if operator == "lte":
+        return value <= lower
+    if operator == "eq":
+        return value == lower
+    if operator == "between" and upper is not None:
+        return lower <= value <= upper
+    return True
 
 
 def _apply_standardized_json_filter(query, column, values: list[str]):
@@ -595,14 +1036,17 @@ def sql_query_resumes(
             query = _apply_standardized_json_filter(query, Resume.standardized_education, resolved_education)
 
         if domain:
-            expanded_domains = _expand_domain_query(domain)
+            extracted_domain = _extract_domain_phrase(domain) or domain
+            expanded_domains = _expand_domain_query(extracted_domain)
             domain_filters = []
-            for d in expanded_domains:
-                domain_filters.append(Resume.domain_expertise.ilike(f"%{d}%"))
-                domain_filters.append(Resume.standardized_education.ilike(f"%{d}%"))
-            
-            query = query.filter(or_(*domain_filters))
-            base_query = base_query.filter(or_(*domain_filters))
+            for idx, d in enumerate(expanded_domains):
+                clause = _domain_clause(Resume, d, f"domain_{idx}")
+                if clause is not None:
+                    domain_filters.append(clause)
+
+            if domain_filters:
+                query = query.filter(or_(*domain_filters))
+                base_query = base_query.filter(or_(*domain_filters))
 
         resumes = query.all()
         fallback_note = None
@@ -666,6 +1110,113 @@ def sql_query_resumes(
 
 
 @tool
+def query_resumes_dynamic(query: str) -> str:
+    """Interpret a natural-language resume query into strict structured filters and return validated results.
+    Use this for user questions combining education/background, skills, and experience constraints.
+    """
+    db = SessionLocal()
+    try:
+        interpretation = _interpret_resume_query(query)
+        base_query = db.query(Resume)
+
+        if interpretation.experience_operator in {"gt", "gte", "eq"} and interpretation.experience_value is not None:
+            threshold = interpretation.experience_value
+            if interpretation.experience_operator == "gt":
+                base_query = base_query.filter(Resume.total_years_experience > threshold)
+            elif interpretation.experience_operator == "gte":
+                base_query = base_query.filter(Resume.total_years_experience >= threshold)
+            elif interpretation.experience_operator == "eq":
+                base_query = base_query.filter(Resume.total_years_experience == threshold)
+        elif interpretation.experience_operator in {"lt", "lte"} and interpretation.experience_value is not None:
+            threshold = interpretation.experience_value
+            if interpretation.experience_operator == "lt":
+                base_query = base_query.filter(Resume.total_years_experience < threshold)
+            else:
+                base_query = base_query.filter(Resume.total_years_experience <= threshold)
+        elif interpretation.experience_operator == "between" and interpretation.experience_value is not None and interpretation.experience_upper_value is not None:
+            base_query = base_query.filter(
+                Resume.total_years_experience >= interpretation.experience_value,
+                Resume.total_years_experience <= interpretation.experience_upper_value,
+            )
+
+        skill_items = _load_common_items(db, "skills")
+        education_items = _load_common_items(db, "education")
+        resolved_education = (
+            _resolve_common_values("education", interpretation.education_query, education_items)
+            if interpretation.education_query else []
+        )
+
+        candidates = base_query.all()
+        validated = []
+        for resume in candidates:
+            if not _matches_experience_filter(
+                resume.total_years_experience or 0.0,
+                interpretation.experience_operator,
+                interpretation.experience_value,
+                interpretation.experience_upper_value,
+            ):
+                continue
+
+            if interpretation.education_query and not _resume_matches_education_query(
+                resume, interpretation.education_query, resolved_education
+            ):
+                continue
+
+            if interpretation.skill_queries and not all(
+                _resume_matches_skill_query(resume, skill_query, skill_items)
+                for skill_query in interpretation.skill_queries
+            ):
+                continue
+
+            if interpretation.excluded_skill_queries and any(
+                _resume_matches_skill_query(resume, skill_query, skill_items)
+                for skill_query in interpretation.excluded_skill_queries
+            ):
+                continue
+
+            if interpretation.domain_query and not _resume_matches_domain_phrase(resume, interpretation.domain_query):
+                continue
+
+            validated.append(resume)
+
+        try:
+            compiled_sql = str(base_query.statement.compile(compile_kwargs={"literal_binds": True}))
+        except Exception as exc:
+            compiled_sql = f"Could not compile SQL: {exc}"
+
+        lines = [
+            f"Interpreted Query: {interpretation.model_dump_json()}",
+            f"Generated SQL:\n```sql\n{compiled_sql}\n```",
+        ]
+        if resolved_education:
+            lines.append(f"Resolved education common values: {', '.join(resolved_education)}")
+
+        if not validated:
+            lines.append("No resumes match the validated filters.")
+            return "\n".join(lines)
+
+        for resume in validated[:20]:
+            parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
+            experience = parsed.get("experience", [])
+            current_role = experience[0].get("role", "N/A") if experience else "N/A"
+            raw_skills = json.loads(resume.skills) if resume.skills else []
+            education_list = json.loads(resume.education) if resume.education else []
+            std_edu = json.loads(resume.standardized_education) if resume.standardized_education else []
+            photo_url = f"/api/resumes/photo/{resume.photo_filename}" if resume.photo_filename else ""
+            lines.append(
+                f"- {resume.name} (ID:{resume.id}) | {current_role} | "
+                f"{resume.total_years_experience} yrs | "
+                f"Education: {', '.join(education_list)} | "
+                f"Std-Edu: {', '.join(std_edu)} | "
+                f"Photo: {photo_url} | "
+                f"Skills: {', '.join(raw_skills[:8])}"
+            )
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@tool
 def get_match_results(tender_id: int, role_title: Optional[str] = None) -> str:
     """Get existing match results for a tender."""
     db = SessionLocal()
@@ -715,5 +1266,60 @@ def get_match_results(tender_id: int, role_title: Optional[str] = None) -> str:
             
             results.append(summary)
         return "\n".join(results)
+    finally:
+        db.close()
+
+
+@tool
+def get_resume_inventory() -> str:
+    """Get the exact current resume inventory with total count, IDs, names, and key summary fields.
+    Use this for questions asking how many resumes exist, which candidates are available, or to list candidate names.
+    """
+    db = SessionLocal()
+    try:
+        resumes = db.query(Resume).order_by(Resume.id.asc()).all()
+        lines = [f"RESUME INVENTORY SUMMARY:", f"- Total Resumes: {len(resumes)}"]
+        for resume in resumes:
+            parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
+            experience = parsed.get("experience", [])
+            current_role = experience[0].get("role", "N/A") if experience else "N/A"
+            lines.append(
+                f"- ID {resume.id}: {resume.name} | Role: {current_role} | Experience: {resume.total_years_experience:g} yrs"
+            )
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@tool
+def get_tender_inventory() -> str:
+    """Get the exact current tender inventory with total count, IDs, and project names."""
+    db = SessionLocal()
+    try:
+        tenders = db.query(Tender).order_by(Tender.id.asc()).all()
+        lines = [f"TENDER INVENTORY SUMMARY:", f"- Total Tenders: {len(tenders)}"]
+        for tender in tenders:
+            lines.append(
+                f"- TND-{tender.id:04d}: {tender.project_name} | Client: {tender.client or 'N/A'}"
+            )
+        return "\n".join(lines)
+    finally:
+        db.close()
+
+
+@tool
+def get_system_stats() -> str:
+    """Get total counts of resumes and tenders currently stored in the system. 
+    Use this to answer questions about 'how many' resumes or tenders exist in total.
+    """
+    db = SessionLocal()
+    try:
+        resume_count = db.query(Resume).count()
+        tender_count = db.query(Tender).count()
+        return (
+            f"SYSTEM INVENTORY SUMMARY:\n"
+            f"- Total Resumes: {resume_count}\n"
+            f"- Total Tenders: {tender_count}\n"
+        )
     finally:
         db.close()

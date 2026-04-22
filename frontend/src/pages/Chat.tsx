@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import type { ReactNode } from 'react';
 import {
   Send,
   Bot,
@@ -8,15 +9,12 @@ import {
   ExternalLink,
   Paperclip,
   MoreVertical,
-  Plus,
-  Share2,
   Users
 } from 'lucide-react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import { cn } from '../utils/utils';
-import { listResumes, getChatHistory } from '../api/client';
-import type { Resume } from '../types';
+import { getChatHistory } from '../api/client';
 
 interface ChatMsg {
   role: 'user' | 'assistant' | 'tool';
@@ -75,7 +73,7 @@ interface ParsedChoice {
   value: string;
 }
 
-let resumeListCache: Promise<Resume[]> | null = null;
+const SHOW_STRUCTURED_RESPONSE_CARDS = false;
 
 function gradeColor(pct: number) {
   if (pct >= 75) return { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-200' };
@@ -86,16 +84,6 @@ function gradeColor(pct: number) {
 
 function normalizeCandidateName(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
-function getCachedResumes() {
-  if (!resumeListCache) {
-    resumeListCache = listResumes().catch((error) => {
-      resumeListCache = null;
-      throw error;
-    });
-  }
-  return resumeListCache;
 }
 
 function compactScore(value?: number) {
@@ -266,6 +254,240 @@ function getResumeCardsFromMessage(msg: ChatMsg) {
   });
 }
 
+function findResumeCardForLine(line: string, cards: ParsedResumeCard[]) {
+  const normalizedLine = normalizeCandidateName(line);
+  return cards.find((card) => {
+    const normalizedName = normalizeCandidateName(card.candidateName);
+    return normalizedName && normalizedLine.includes(normalizedName);
+  });
+}
+
+function sanitizeResumeAnswerContent(content: string) {
+  return content
+    .split('\n')
+    .filter((line) => !/^\s*[-*]\s+\!\[.*?\]\(.*?\)\s*$/i.test(line))
+    .filter((line) => !/^\s*[-*]\s+\*?\*?photo\*?\*?:/i.test(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function cleanResumeSectionTitle(line: string) {
+  return line
+    .replace(/^#{1,6}\s*/, '')
+    .replace(/^\*\*/, '')
+    .replace(/\*\*:?$/, '')
+    .replace(/:$/, '')
+    .trim();
+}
+
+function isResumeSectionHeading(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith('- ') || trimmed.startsWith('* ')) return false;
+  if (!trimmed.endsWith(':')) return false;
+
+  const title = cleanResumeSectionTitle(trimmed).toLowerCase();
+  return [
+    'contact information',
+    'contact details',
+    'skills',
+    'technical skills',
+    'core skills',
+    'experience',
+    'professional experience',
+    'education',
+    'projects',
+    'certifications',
+    'summary',
+    'profile summary',
+    'achievements'
+  ].includes(title);
+}
+
+function parseResumeSections(content: string) {
+  const lines = content.split('\n');
+  const intro: string[] = [];
+  const sections: { title: string; items: string[] }[] = [];
+  let currentSection: { title: string; items: string[] } | null = null;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (isResumeSectionHeading(line)) {
+      currentSection = { title: cleanResumeSectionTitle(line), items: [] };
+      sections.push(currentSection);
+      continue;
+    }
+
+    if (currentSection) {
+      currentSection.items.push(line.replace(/^[-*]\s+/, '').trim());
+    } else {
+      intro.push(line);
+    }
+  }
+
+  return { intro: intro.join('\n').trim(), sections };
+}
+
+function ResumeInlineAnswer({ content, cards }: { content: string; cards: ParsedResumeCard[] }) {
+  const sanitizedContent = sanitizeResumeAnswerContent(content);
+  const { intro, sections } = parseResumeSections(sanitizedContent);
+  const primaryCard = cards[0];
+  const detailView = cards.length === 1 && sections.length > 0;
+
+  if (detailView && primaryCard) {
+    return (
+      <div className="space-y-5">
+        {intro && (
+          <div className="prose prose-slate prose-sm max-w-none text-[15px] leading-relaxed">
+            <MarkdownRenderer content={intro} />
+          </div>
+        )}
+
+        <div className="ai-inline-person not-prose rounded-[1.75rem] border border-slate-200/80 bg-white/90 p-5 shadow-[0_24px_50px_-28px_rgba(15,23,42,0.45)] backdrop-blur-sm">
+          <div className="flex items-start gap-4">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-violet-100 bg-violet-50 shadow-sm shrink-0">
+              {primaryCard.photoUrl ? (
+                <img src={primaryCard.photoUrl} alt="" className="h-full w-full rounded-2xl object-cover" />
+              ) : (
+                <Users className="w-5 h-5 text-violet-500" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-[20px] font-black tracking-tight text-slate-900">{primaryCard.candidateName}</h3>
+                {primaryCard.resumeId && (
+                  <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500">
+                    ID {primaryCard.resumeId}
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <span className="rounded-full bg-violet-50 px-3 py-1 text-[11px] font-bold text-violet-700 border border-violet-100">
+                  {primaryCard.role || 'Personnel Profile'}
+                </span>
+                {primaryCard.experience && (
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold text-slate-600 border border-slate-200">
+                    {primaryCard.experience}
+                  </span>
+                )}
+                {primaryCard.education && (
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold text-slate-600 border border-slate-200">
+                    {primaryCard.education}
+                  </span>
+                )}
+              </div>
+            </div>
+            {primaryCard.resumeId && (
+              <Link
+                to={`/resumes/${primaryCard.resumeId}`}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-violet-100 bg-violet-50 px-3 py-2 text-[10px] font-black uppercase tracking-[0.18em] text-violet-600 transition-all hover:bg-violet-600 hover:text-white shrink-0"
+              >
+                Open Resume <ExternalLink className="w-3 h-3" />
+              </Link>
+            )}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4">
+          {sections.map((section, index) => (
+            <section
+              key={`${section.title}-${index}`}
+              className="not-prose rounded-[1.5rem] border border-slate-200/80 bg-white/88 p-5 shadow-[0_18px_38px_-28px_rgba(15,23,42,0.45)] backdrop-blur-sm"
+            >
+              <div className="mb-4 flex items-center gap-3">
+                <div className="h-2.5 w-2.5 rounded-full bg-violet-500 shadow-[0_0_12px_rgba(139,92,246,0.45)]" />
+                <h4 className="text-[15px] font-black tracking-tight text-slate-900">{section.title}</h4>
+              </div>
+              <div className="space-y-2">
+                {section.items.map((item, itemIndex) => (
+                  <div
+                    key={`${section.title}-${itemIndex}`}
+                    className="rounded-2xl border border-slate-100 bg-slate-50/80 px-4 py-3 text-[14px] font-medium leading-relaxed text-slate-700"
+                  >
+                    {item}
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const lines = sanitizedContent.split('\n');
+  const blocks: ReactNode[] = [];
+  let buffer: string[] = [];
+  let candidateCount = 0;
+
+  const flushBuffer = () => {
+    const chunk = buffer.join('\n').trim();
+    if (chunk) {
+      blocks.push(
+        <div key={`chunk-${blocks.length}`} className="prose prose-slate prose-sm max-w-none text-[15px] leading-relaxed">
+          <MarkdownRenderer content={chunk} />
+        </div>
+      );
+    }
+    buffer = [];
+  };
+
+  for (const line of lines) {
+    const matchedCard = findResumeCardForLine(line, cards);
+    if (!matchedCard) {
+      buffer.push(line);
+      continue;
+    }
+
+    flushBuffer();
+    candidateCount += 1;
+
+    const idMatch = line.match(/\(ID:\s*(\d+)\)/i);
+    blocks.push(
+      <div
+        key={`candidate-${candidateCount}-${matchedCard.resumeId || matchedCard.candidateName}`}
+        className="ai-inline-person not-prose flex items-center gap-3 rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm animate-in fade-in slide-in-from-left-2 duration-500"
+        style={{ animationDelay: `${candidateCount * 80}ms` }}
+      >
+        <div className="w-2 h-2 rounded-full bg-violet-500 shrink-0" />
+        <div className="w-11 h-11 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center overflow-hidden shrink-0 shadow-sm">
+          {matchedCard.photoUrl ? (
+            <img src={matchedCard.photoUrl} alt="" className="w-full h-full object-cover" />
+          ) : (
+            <Users className="w-4 h-4 text-slate-400" />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[15px] font-black text-slate-900 tracking-tight">{matchedCard.candidateName}</span>
+            {idMatch?.[1] && (
+              <span className="text-[12px] font-semibold text-slate-500">(ID: {idMatch[1]})</span>
+            )}
+          </div>
+          <div className="mt-1 text-[11px] font-semibold text-slate-500">
+            {matchedCard.role || 'Personnel Profile'}
+            {matchedCard.experience ? ` | ${matchedCard.experience}` : ''}
+          </div>
+        </div>
+        {matchedCard.resumeId && (
+          <Link
+            to={`/resumes/${matchedCard.resumeId}`}
+            className="inline-flex items-center gap-1.5 text-[9px] text-violet-600 font-black hover:bg-violet-600 hover:text-white transition-all bg-violet-50 px-3 py-2 rounded-xl border border-violet-100 uppercase tracking-wider shadow-sm shrink-0"
+          >
+            Profile <ExternalLink className="w-2.5 h-2.5" />
+          </Link>
+        )}
+      </div>
+    );
+  }
+
+  flushBuffer();
+
+  return <div className="space-y-3">{blocks}</div>;
+}
+
 function parseTenderCardsFromToolResult(result?: string): ParsedTenderCard[] {
   if (!result) return [];
 
@@ -297,26 +519,45 @@ function parseTenderCardsFromToolResult(result?: string): ParsedTenderCard[] {
       const projectName = detailHeader[2].trim();
       let client = "N/A";
       let duration = "N/A";
+      let ref = "N/A";
+      let date = "N/A";
       let techs: string[] = [];
       let roles: string[] = [];
+      let rolesCount: number | undefined;
 
       // Parse next few lines for details
       let j = i + 1;
-      while (j < lines.length && j < i + 10) {
+      let inRequiredRoles = false;
+      while (j < lines.length && j < i + 14) {
         const nextLine = lines[j];
-        if (nextLine.includes('Client:')) {
-          const cm = nextLine.match(/Client:\s+(.+?)(?:\s+\||\s*$)/);
+        const normalizedLine = nextLine.replace(/^-\s+/, '');
+
+        if (normalizedLine.includes('Client:')) {
+          const cm = normalizedLine.match(/Client:\s+(.+?)(?:\s+\||\s*$)/);
           if (cm) client = cm[1].trim();
-          const dm = nextLine.match(/Duration:\s+(.+?)(?:\s+\||\s*$)/);
+          const dm = normalizedLine.match(/Duration:\s+(.+?)(?:\s+\||\s*$)/);
           if (dm) duration = dm[1].trim();
         }
-        if (nextLine.includes('Technologies:')) {
-          techs = nextLine.replace(/Technologies:\s+/, '').split(',').map(t => t.trim()).filter(Boolean);
+        if (normalizedLine.includes('Ref:') || normalizedLine.includes('Reference:')) {
+          const rm = normalizedLine.match(/(?:Ref|Reference):\s+(.+?)(?:\s+\||\s*$)/);
+          if (rm) ref = rm[1].trim();
+          const dtm = normalizedLine.match(/Date:\s+(.+?)(?:\s+\||\s*$)/);
+          if (dtm) date = dtm[1].trim();
         }
-        if (nextLine.startsWith('Roles (')) {
-          // Skip roles line
-        } else if (nextLine.startsWith('- ') || nextLine.startsWith('  - ')) {
-          roles.push(nextLine.replace(/^[\s-]*\s+/, '').trim());
+        if (normalizedLine.includes('Technologies:')) {
+          techs = normalizedLine.replace(/Technologies:\s+/, '').split(',').map(t => t.trim()).filter(Boolean);
+        }
+        if (normalizedLine.startsWith('Roles (')) {
+          const countMatch = normalizedLine.match(/Roles\s+\((\d+)\)/i);
+          if (countMatch) rolesCount = Number(countMatch[1]);
+          inRequiredRoles = true;
+        } else if (normalizedLine.startsWith('Roles Count:')) {
+          const countMatch = normalizedLine.match(/Roles Count:\s+(\d+)/i);
+          if (countMatch) rolesCount = Number(countMatch[1]);
+        } else if (normalizedLine.startsWith('Required Roles:')) {
+          inRequiredRoles = true;
+        } else if (inRequiredRoles && nextLine.startsWith('- ')) {
+          roles.push(normalizedLine);
         }
 
         if (lines[j + 1]?.startsWith('**TND-')) break; // Next tender start
@@ -328,7 +569,10 @@ function parseTenderCardsFromToolResult(result?: string): ParsedTenderCard[] {
         projectName,
         client,
         duration,
+        ref,
+        date,
         techs,
+        rolesCount,
         roles
       });
       i = j; // Advance outer loop
@@ -492,6 +736,23 @@ function ChatTenderCards({ cards }: { cards: ParsedTenderCard[] }) {
             </div>
           </div>
 
+          {(item.ref || item.date || item.duration) && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <div className="p-3 bg-slate-50/40 rounded-2xl border border-slate-100/50">
+                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Duration</span>
+                <p className="text-[11px] font-bold text-slate-600 truncate">{item.duration || 'N/A'}</p>
+              </div>
+              <div className="p-3 bg-slate-50/40 rounded-2xl border border-slate-100/50">
+                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Reference</span>
+                <p className="text-[11px] font-bold text-slate-600 truncate">{item.ref || 'N/A'}</p>
+              </div>
+              <div className="p-3 bg-slate-50/40 rounded-2xl border border-slate-100/50">
+                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Date</span>
+                <p className="text-[11px] font-bold text-slate-600 truncate">{item.date || 'N/A'}</p>
+              </div>
+            </div>
+          )}
+
           {item.techs.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {item.techs.map((tech, ti) => (
@@ -529,68 +790,6 @@ function ChatTenderCards({ cards }: { cards: ParsedTenderCard[] }) {
   );
 }
 
-function ChatResumeCards({ cards }: { cards: ParsedResumeCard[] }) {
-  if (cards.length === 0) return null;
-
-  return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full">
-      {cards.map((item, idx) => (
-        <div key={idx} className="group relative bg-white border border-slate-200 rounded-3xl p-5 transition-all hover:border-violet-200 hover:shadow-xl hover:shadow-slate-200/40 flex flex-col gap-4 overflow-hidden animate-in slide-in-from-bottom-4 duration-500" style={{ animationDelay: `${idx * 100}ms` }}>
-          <div className="flex items-start justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-2xl bg-slate-50 border border-slate-100 flex items-center justify-center text-slate-400 group-hover:bg-violet-50 group-hover:border-violet-100 group-hover:text-violet-600 transition-colors shrink-0 overflow-hidden">
-                {item.photoUrl ? (
-                  <img src={item.photoUrl} alt="" className="w-full h-full object-cover" />
-                ) : (
-                  <Users className="w-5 h-5" />
-                )}
-              </div>
-              <div>
-                <h3 className="text-sm font-black text-slate-900 uppercase tracking-tight leading-none mb-1">{item.candidateName}</h3>
-                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{item.role || 'Personnel Profile'}</p>
-              </div>
-            </div>
-            {item.resumeId && (
-              <Link
-                to={`/resumes/${item.resumeId}`}
-                className="flex items-center gap-1.5 text-[9px] text-violet-600 font-black hover:bg-violet-600 hover:text-white transition-all bg-violet-50 px-3 py-2 rounded-xl border border-violet-100 uppercase tracking-wider shadow-sm"
-              >
-                Profile <ExternalLink className="w-2.5 h-2.5" />
-              </Link>
-            )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            <div className="p-3 bg-slate-50/50 rounded-2xl border border-slate-100/50">
-              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Expertise</span>
-              <p className="text-[11px] font-bold text-slate-600 truncate">{item.experience || 'N/A'}</p>
-            </div>
-            <div className="p-3 bg-slate-50/50 rounded-2xl border border-slate-100/50">
-              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest block mb-1">Education</span>
-              <p className="text-[11px] font-bold text-slate-600 truncate">{item.education || 'N/A'}</p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap gap-1.5">
-            {item.skills.map((skill, si) => (
-              <span key={si} className="px-2.5 py-1 rounded-lg bg-white border border-slate-100 text-[9px] font-bold text-slate-500 shadow-sm group-hover:border-violet-100 group-hover:text-violet-700 transition-all">
-                {skill}
-              </span>
-            ))}
-          </div>
-
-          {item.relevance && (
-            <div className="mt-auto pt-4 border-t border-slate-50 flex items-center justify-between">
-              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Relevance Index</span>
-              <span className="text-[11px] text-violet-600 font-black uppercase tracking-tight bg-violet-50 px-2 py-1 rounded-lg">{item.relevance}</span>
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function ChatChoices({ question, choices, onSelect, disabled }: { question?: string; choices: ParsedChoice[]; onSelect: (label: string, value: string) => void; disabled?: boolean }) {
   if (choices.length === 0) return null;
 
@@ -602,10 +801,10 @@ function ChatChoices({ question, choices, onSelect, disabled }: { question?: str
             <BrainCircuit className="w-4 h-4 text-white" />
           </div>
           <div className="flex-1">
-            <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-0.5 leading-none">Intelligence Protocol</h4>
-            <p className="text-[13px] font-black text-slate-900 leading-tight">{question || 'Selection Required'}</p>
+            <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-0.5 leading-none">Decision Console</h4>
+            <p className="text-[13px] font-black text-slate-900 leading-tight">{question || 'Input Required'}</p>
           </div>
-          <span className="text-[9px] font-black text-violet-600 bg-violet-50 px-3 py-1.5 rounded-full uppercase tracking-widest border border-violet-100 animate-pulse">Decision Point</span>
+          <span className="text-[9px] font-black text-violet-600 bg-violet-50 px-3 py-1.5 rounded-full uppercase tracking-widest border border-violet-100 animate-pulse">Action Required</span>
         </div>
         <div className="p-4 bg-white/50">
           <div className="flex flex-col gap-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-1">
@@ -654,9 +853,9 @@ export default function Chat() {
   const [pendingQuestion, setPendingQuestion] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingStep, setLoadingStep] = useState('');
-  const [showThought, setShowThought] = useState<Record<number, boolean>>({});
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // 1. Session ID Management
@@ -684,7 +883,14 @@ export default function Chat() {
       const formatted: ChatMsg[] = history.map(m => ({
         role: m.role as any,
         content: m.content,
-        toolCalls: m.tool_calls ? JSON.parse(m.tool_calls).map((tc: any) => ({ ...tc, expanded: false })) : undefined
+        toolCalls: m.tool_calls
+          ? JSON.parse(m.tool_calls).map((tc: any) => ({
+              tool: tc.tool,
+              input: tc.input,
+              result: tc.result ?? tc.output,
+              expanded: false,
+            }))
+          : undefined
       }));
       setMessages(formatted);
     } catch (error) {
@@ -701,7 +907,12 @@ export default function Chat() {
   }, [input]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: 'smooth',
+    });
   }, [messages, loading]);
 
   const toggleToolLog = (msgIdx: number, toolIdx: number) => {
@@ -770,7 +981,7 @@ export default function Chat() {
             const data = JSON.parse(line.slice(6));
             if (data.event === 'thought') {
               setLoadingStep('Synthesizing Knowledge');
-              currentMsg.thought = (currentMsg.thought || '') + data.content;
+              currentMsg.thought = (currentMsg.thought || '') + (data.content || data.token || data.message || '');
             } else if (data.event === 'answer') {
               setLoadingStep('Finalizing Response');
               currentMsg.content += data.content;
@@ -834,14 +1045,14 @@ export default function Chat() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-50 text-slate-900">
+    <div className="ai-stage relative flex flex-col h-full min-h-0 bg-slate-50 text-slate-900 overflow-hidden">
       {/* Desktop Header Overlay */}
-      <header className="hidden lg:flex px-8 py-5 items-center justify-between border-b border-slate-200 backdrop-blur-md sticky top-0 z-40 bg-white/80">
+      <header className="ai-topbar hidden lg:flex px-8 py-5 items-center justify-between border-b border-slate-200 backdrop-blur-md sticky top-0 z-40 bg-white/80">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2.5">
             <div className="w-2 h-2 rounded-full bg-violet-500 shadow-[0_0_10px_rgba(139,92,246,0.3)] animate-pulse" />
             <h2 className="text-[11px] font-black text-slate-400 uppercase tracking-[0.25em]">
-              Matcher Intelligence
+              MatchOps Command
             </h2>
           </div>
         </div>
@@ -853,33 +1064,33 @@ export default function Chat() {
       </header>
 
       {/* Messages Container */}
-      <div className="flex-1 overflow-y-auto custom-scrollbar pt-4 pb-32">
+      <div ref={messagesContainerRef} className="flex-1 min-h-0 overflow-y-auto custom-scrollbar pt-4 pb-48 md:pb-56">
         <div className="max-w-4xl mx-auto px-4 md:px-8 space-y-12">
           {messages.length === 0 && (
-            <div className="py-20 text-center animate-in fade-in zoom-in duration-1000">
-              <div className="w-16 h-16 rounded-2xl bg-white border border-slate-100 flex items-center justify-center mx-auto mb-8 shadow-xl shadow-slate-200/50">
+            <div className="ai-hero py-20 text-center animate-in fade-in zoom-in duration-1000">
+              <div className="ai-hero-badge w-16 h-16 rounded-2xl bg-white border border-slate-100 flex items-center justify-center mx-auto mb-8 shadow-xl shadow-slate-200/50">
                 <BrainCircuit className="w-8 h-8 text-violet-500" />
               </div>
               <h1 className="text-4xl md:text-5xl font-black tracking-tighter text-slate-900 mb-4">
-                Matcher Intelligence <br />
-                <span className="text-slate-400 font-medium">Unified Strategic Agent.</span>
+                MatchOps AI <br />
+                <span className="text-slate-400 font-medium">Tender & Talent Intelligence.</span>
               </h1>
               <p className="text-slate-500 text-sm font-medium max-w-md mx-auto">
-                Ready to analyze tenders, match resumes, and execute strategic queries across your workspace.
+                Analyze tenders, shortlist candidates, and run high-confidence workspace queries from one command center.
               </p>
             </div>
           )}
 
           {messages.map((msg, i) => {
             const matchCards = msg.role === 'assistant' ? getMatchCardsFromMessage(msg) : [];
-            const tenderCards = msg.role === 'assistant' && matchCards.length === 0 ? getTenderCardsFromMessage(msg) : [];
-            const resumeCards = msg.role === 'assistant' && matchCards.length === 0 && tenderCards.length === 0 ? getResumeCardsFromMessage(msg) : [];
+            const resumeCards = msg.role === 'assistant' ? getResumeCardsFromMessage(msg) : [];
+            const tenderCards = msg.role === 'assistant' ? getTenderCardsFromMessage(msg) : [];
 
             return (
               <div
                 key={i}
                 className={cn(
-                  "group relative animate-in fade-in duration-700",
+                  "message-lift group relative animate-in fade-in duration-700",
                   msg.role === 'user' ? "flex justify-end" : "flex justify-start"
                 )}
               >
@@ -898,17 +1109,16 @@ export default function Chat() {
                   <div className={cn(
                     "relative transition-all duration-500",
                     msg.role === 'user'
-                      ? "bg-violet-600 text-white px-6 py-4 rounded-[1.8rem] shadow-xl shadow-violet-200/50"
+                      ? "prompt-pill bg-violet-600 text-white px-6 py-4 rounded-[1.8rem] shadow-xl shadow-violet-200/50"
                       : "text-slate-800"
                   )}>
                     {msg.role === 'user' ? (
                       <div className="text-[14px] font-semibold leading-relaxed tracking-tight">{msg.content}</div>
-                    ) : matchCards.length > 0 ? (
-                      <ChatMatchCards cards={matchCards} />
-                    ) : tenderCards.length > 0 ? (
-                      <ChatTenderCards cards={tenderCards} />
-                    ) : resumeCards.length > 0 ? (
-                      <ChatResumeCards cards={resumeCards} />
+                    ) : SHOW_STRUCTURED_RESPONSE_CARDS && resumeCards.length > 0 ? (
+                      <ResumeInlineAnswer
+                        content={msg.content.replace(/\[\[CHOICE:.*?\]\]/g, '').trim()}
+                        cards={resumeCards}
+                      />
                     ) : (
                       <div className="prose prose-slate prose-sm max-w-none text-[15px] leading-relaxed">
                         <MarkdownRenderer content={msg.content.replace(/\[\[CHOICE:.*?\]\]/g, '').trim()} />
@@ -921,7 +1131,7 @@ export default function Chat() {
                     <div className="mt-8 pt-8 border-t border-slate-200 space-y-4">
                       <div className="flex items-center gap-3 mb-2 px-1">
                         <Terminal className="w-3.5 h-3.5 text-slate-400" />
-                        <span className="text-[9px] font-bold uppercase tracking-[0.3em] text-slate-400">Strategic Resolution Log</span>
+                        <span className="text-[9px] font-bold uppercase tracking-[0.3em] text-slate-400">Execution Trace</span>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         {msg.toolCalls.map((tc, j) => (
@@ -957,6 +1167,18 @@ export default function Chat() {
                       )}
                     </div>
                   ))}
+                  {SHOW_STRUCTURED_RESPONSE_CARDS && matchCards.length > 0 && (
+                    <div className="mt-6">
+                      <ChatMatchCards cards={matchCards} />
+                    </div>
+                  )}
+
+                  {SHOW_STRUCTURED_RESPONSE_CARDS && tenderCards.length > 0 && (
+                    <div className="mt-6">
+                      <ChatTenderCards cards={tenderCards} />
+                    </div>
+                  )}
+
                 </div>
               </div>
             );
@@ -969,8 +1191,8 @@ export default function Chat() {
       </div>
 
       {/* Input Dock */}
-      <div className="fixed bottom-0 left-0 lg:left-[280px] right-0 p-4 md:p-10 pointer-events-none">
-        <div className="max-w-4xl mx-auto w-full pointer-events-auto flex flex-col items-center">
+      <div className="chat-input-shell fixed bottom-0 left-0 right-0 lg:left-[var(--sidebar-offset)] z-30 p-4 md:px-6 md:pb-6 pointer-events-none">
+        <div className="mx-auto w-full max-w-3xl pointer-events-auto flex flex-col items-center">
           <ChatChoices
             question={pendingQuestion}
             choices={pendingChoices}
@@ -979,16 +1201,16 @@ export default function Chat() {
           />
 
           <div className={cn(
-            "w-full bg-white border border-slate-200 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.1)] transition-all duration-500 group relative overflow-hidden",
+            "ai-dock w-full bg-white border border-slate-200 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.1)] transition-all duration-500 group relative overflow-hidden",
             pendingChoices.length > 0 ? "rounded-b-[2rem] border-t-0" : "rounded-[2rem]",
             "focus-within:border-violet-300 focus-within:ring-4 focus-within:ring-violet-500/5"
           )}>
-            <div className="flex items-end gap-1 px-4 py-2 md:px-5 md:py-3">
-              <button className="p-3 text-slate-400 hover:text-slate-600 transition-colors shrink-0">
+            <div className="flex items-end gap-1 px-3 py-2 md:px-4 md:py-2.5">
+              <button className="p-2.5 text-slate-400 hover:text-slate-600 transition-colors shrink-0">
                 <Paperclip className="w-5 h-5" />
               </button>
 
-              <div className="flex-1 flex flex-col min-w-0 pb-1">
+              <div className="flex-1 flex flex-col min-w-0 pb-0.5">
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -1000,24 +1222,24 @@ export default function Chat() {
                       handleSend();
                     }
                   }}
-                  placeholder="Message Matcher or type '/' for commands..."
-                  className="w-full bg-transparent py-3 text-[15px] font-semibold text-slate-900 outline-none placeholder:text-slate-300 resize-none max-h-48 custom-scrollbar"
+                  placeholder="Ask MatchOps AI or type '/' for commands..."
+                  className="w-full bg-transparent py-2 text-[14px] font-semibold text-slate-900 outline-none placeholder:text-slate-300 resize-none max-h-32 custom-scrollbar"
                   disabled={loading}
                 />
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex items-center gap-2 mt-1">
                   <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-violet-50 border border-violet-100">
                     <div className="w-1.5 h-1.5 rounded-full bg-violet-500 shadow-[0_0_5px_rgba(139,92,246,0.5)]" />
-                    <span className="text-[8px] font-black text-violet-600 uppercase tracking-widest">Agentic Workspace Active</span>
+                    <span className="text-[8px] font-black text-violet-600 uppercase tracking-widest">AI Workspace Online</span>
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 pb-1.5">
+              <div className="flex items-center gap-2 pb-1">
                 <button
                   onClick={() => handleSend()}
                   disabled={!input.trim() || loading}
                   className={cn(
-                    "p-3 rounded-2xl transition-all active:scale-90 flex items-center justify-center",
+                    "p-2.5 rounded-[1.1rem] transition-all active:scale-90 flex items-center justify-center",
                     input.trim() ? "bg-violet-600 text-white shadow-lg shadow-violet-200" : "bg-slate-100 text-slate-300"
                   )}
                 >

@@ -3,6 +3,7 @@ import asyncio
 import json
 from typing import Optional
 from langchain_core.tools import tool
+from sqlalchemy import case
 
 from app.services.embedding import embed_texts, query_similar_resumes
 from app.database import SessionLocal
@@ -14,16 +15,30 @@ def search_resumes(query: str) -> str:
     """Search resumes by semantic similarity. Use for natural language queries like 'find candidates with drone experience' or 'engineers with GIS skills'."""
     async def _run():
         embeddings = await embed_texts([query])
-        results = query_similar_resumes(embeddings[0], n_results=10)
+        results = query_similar_resumes(embeddings[0], n_results=50)
         if not results["ids"] or not results["ids"][0]:
             return "No matching resumes found."
 
         db = SessionLocal()
         try:
+            ranked_ids = [int(rid) for rid in results["ids"][0]]
+            distance_by_id = {
+                int(rid): dist for rid, dist in zip(results["ids"][0], results["distances"][0])
+            }
+            order_by_rank = case(
+                {rid: idx for idx, rid in enumerate(ranked_ids)},
+                value=Resume.id,
+            )
+            resumes = (
+                db.query(Resume)
+                .filter(Resume.id.in_(ranked_ids))
+                .order_by(order_by_rank)
+                .all()
+            )
             output = []
-            for rid_str, dist in zip(results["ids"][0], results["distances"][0]):
-                resume = db.query(Resume).filter(Resume.id == int(rid_str)).first()
-                if not resume:
+            for resume in resumes:
+                dist = distance_by_id.get(resume.id)
+                if dist is None:
                     continue
                 similarity = max(0, 1 - dist)
                 parsed = json.loads(resume.parsed_data) if resume.parsed_data else {}
@@ -50,17 +65,31 @@ def search_tenders(query: str) -> str:
     async def _run():
         embeddings = await embed_texts([query])
         from app.services.embedding import query_similar_tenders
-        results = query_similar_tenders(embeddings[0], n_results=10)
+        results = query_similar_tenders(embeddings[0], n_results=50)
         
         if not results["ids"] or not results["ids"][0]:
             return "No matching tenders found."
 
         db = SessionLocal()
         try:
+            ranked_ids = [int(tid) for tid in results["ids"][0]]
+            distance_by_id = {
+                int(tid): dist for tid, dist in zip(results["ids"][0], results["distances"][0])
+            }
+            order_by_rank = case(
+                {tid: idx for idx, tid in enumerate(ranked_ids)},
+                value=Tender.id,
+            )
+            tenders = (
+                db.query(Tender)
+                .filter(Tender.id.in_(ranked_ids))
+                .order_by(order_by_rank)
+                .all()
+            )
             output = []
-            for tid_str, dist in zip(results["ids"][0], results["distances"][0]):
-                tender = db.query(Tender).filter(Tender.id == int(tid_str)).first()
-                if not tender:
+            for tender in tenders:
+                dist = distance_by_id.get(tender.id)
+                if dist is None:
                     continue
                 similarity = max(0, 1 - dist)
                 roles = json.loads(tender.required_roles) if tender.required_roles else []
