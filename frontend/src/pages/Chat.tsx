@@ -30,6 +30,7 @@ interface ParsedMatchCard {
   designation?: string;
   experienceYears?: string;
   photoUrl?: string;
+  profileUrl?: string;
   fitScore: number;
   structuredScore?: number;
   aiScore?: number;
@@ -53,6 +54,7 @@ interface ParsedResumeCard {
   skills: string[];
   relevance?: string;
   photoUrl?: string;
+  profileUrl?: string;
 }
 
 interface ParsedTenderCard {
@@ -73,7 +75,7 @@ interface ParsedChoice {
   value: string;
 }
 
-const SHOW_STRUCTURED_RESPONSE_CARDS = false;
+const SHOW_STRUCTURED_RESPONSE_CARDS = true;
 
 function gradeColor(pct: number) {
   if (pct >= 75) return { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-200' };
@@ -127,6 +129,7 @@ function parseMatchCards(result?: string): ParsedMatchCard[] {
         designation: fields.designation,
         experienceYears: fields.experience,
         photoUrl: fields['photo url'],
+        profileUrl: fields['profile url'],
         fitScore,
         structuredScore: fields['structured score'] ? Number(fields['structured score']) : undefined,
         aiScore: fields['ai score'] ? Number(fields['ai score']) : undefined,
@@ -171,12 +174,12 @@ function parseResumeCardsFromToolResult(result?: string): ParsedResumeCard[] {
     .map((line) => line.trim())
     .filter((line) => line.startsWith('- ') && line.includes('(ID:') && line.includes(' | '))
     .map((line): ParsedResumeCard | null => {
-      const nameMatch = line.match(/^-\s+\*\*(.*?)\*\*\s+\(ID:(\d+)\)\s+\|\s+(.+)$/) || line.match(/^-\s+(.*?)\s+\(ID:(\d+)\)\s+\|\s+(.+)$/);
+      const nameMatch = line.match(/^-\s+\*\*(.*?)\*\*\s+\(ID:\s*(\d+)\)\s+\|\s+(.+)$/) || line.match(/^-\s+(.*?)\s+\(ID:\s*(\d+)\)\s+\|\s+(.+)$/);
       if (!nameMatch) return null;
 
       const [, rawName, rawId, rest] = nameMatch;
       const parts = rest.split(/\s+\|\s+/);
-      const fields = parseFields(`- ${parts.slice(2).join(' | ')}`);
+      const fields = parseFields(line);
       const skillsText = fields.skills || '';
       const skills = skillsText
         .split(',')
@@ -187,15 +190,62 @@ function parseResumeCardsFromToolResult(result?: string): ParsedResumeCard[] {
       return {
         candidateName: rawName.trim(),
         resumeId: Number(rawId),
-        role: parts[0]?.trim(),
-        experience: parts[1]?.trim(),
+        role: fields.role || parts[0]?.replace(/^role:\s*/i, '').trim(),
+        experience: fields.experience || parts[1]?.replace(/^experience:\s*/i, '').trim(),
         education: fields.education,
         skills,
         relevance: fields.relevance,
-        photoUrl: fields.photo,
+        photoUrl: fields['photo url'] || fields.photo,
+        profileUrl: fields['profile url'] || `/resumes/${rawId}`,
       };
     })
     .filter((item): item is ParsedResumeCard => item !== null);
+}
+
+function parseResumeCardsFromDetailToolResult(result?: string): ParsedResumeCard[] {
+  if (!result) return [];
+  const lines = result
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const header = lines[0];
+  const headerMatch = header.match(/^\*\*(.*?)\*\*\s+\(ID:\s*(\d+)\)/) || header.match(/^(.*?)\s+\(ID:\s*(\d+)\)/);
+  if (!headerMatch) return [];
+
+  const [, rawName, rawId] = headerMatch;
+  const card: ParsedResumeCard = {
+    candidateName: rawName.trim(),
+    resumeId: Number(rawId),
+    skills: [],
+    profileUrl: `/resumes/${rawId}`,
+  };
+
+  for (const line of lines.slice(1)) {
+    if (/^role:/i.test(line)) card.role = line.replace(/^role:\s*/i, '').trim();
+    if (/^experience:/i.test(line)) card.experience = line.replace(/^experience:\s*/i, '').trim();
+    if (/^education:/i.test(line)) card.education = line.replace(/^education:\s*/i, '').trim();
+    if (/^skills:/i.test(line)) {
+      card.skills = line
+        .replace(/^skills:\s*/i, '')
+        .split(',')
+        .map((skill) => skill.trim())
+        .filter(Boolean)
+        .slice(0, 8);
+    }
+
+    const pipeFields = parseFields(line);
+    if (pipeFields['photo url']) card.photoUrl = pipeFields['photo url'];
+    if (pipeFields['profile url']) card.profileUrl = pipeFields['profile url'];
+
+    const photoMatch = line.match(/photo url:\s*([^|]+)(?:\s*\||$)/i);
+    if (photoMatch?.[1]) card.photoUrl = photoMatch[1].trim();
+    const profileMatch = line.match(/profile url:\s*([^|]+)(?:\s*\||$)/i);
+    if (profileMatch?.[1]) card.profileUrl = profileMatch[1].trim();
+  }
+
+  return [card];
 }
 
 function parseResumeCardsFromContent(content?: string): ParsedResumeCard[] {
@@ -206,16 +256,20 @@ function parseResumeCardsFromContent(content?: string): ParsedResumeCard[] {
   let current: ParsedResumeCard | null = null;
 
   for (const line of content.split('\n')) {
-    const candidateMatch = line.match(/^\s*[-*]\s+\*\*(.+?)\*\*\s*$/);
+    const candidateMatch = line.match(/^\s*(?:[-*]\s+)?\*\*(.+?)\*\*(?:\s*\(ID:\s*(\d+)\))?\s*$/);
     if (candidateMatch) {
-      current = { candidateName: candidateMatch[1].trim(), skills: [] };
+      current = {
+        candidateName: candidateMatch[1].trim(),
+        resumeId: candidateMatch[2] ? Number(candidateMatch[2]) : undefined,
+        skills: [],
+      };
       cards.push(current);
       continue;
     }
 
     if (!current) continue;
 
-    const fieldMatch = line.match(/^\s*[-*]\s+\*\*(Role|Experience|Education|Skills):\*\*\s*(.+)$/i);
+    const fieldMatch = line.match(/^\s*[-*]?\s*\*?\*?(Role|Experience|Education|Skills|Photo URL|Profile URL)\*?\*?:\s*(.+)$/i);
     if (!fieldMatch) continue;
 
     const key = fieldMatch[1].toLowerCase();
@@ -223,6 +277,8 @@ function parseResumeCardsFromContent(content?: string): ParsedResumeCard[] {
     if (key === 'role') current.role = value;
     if (key === 'experience') current.experience = value;
     if (key === 'education') current.education = value;
+    if (key === 'photo url') current.photoUrl = value;
+    if (key === 'profile url') current.profileUrl = value;
     if (key === 'skills') {
       current.skills = value
         .split(',')
@@ -238,8 +294,14 @@ function parseResumeCardsFromContent(content?: string): ParsedResumeCard[] {
 function getResumeCardsFromMessage(msg: ChatMsg) {
   const cards: ParsedResumeCard[] = [];
   msg.toolCalls
-    ?.filter((tc) => tc.tool === 'sql_query_resumes' || tc.tool === 'search_resumes')
-    .forEach((tc) => cards.push(...parseResumeCardsFromToolResult(tc.result)));
+    ?.forEach((tc) => {
+      if (tc.tool === 'sql_query_resumes' || tc.tool === 'search_resumes' || tc.tool === 'query_resumes_dynamic' || tc.tool === 'get_resume_inventory') {
+        cards.push(...parseResumeCardsFromToolResult(tc.result));
+      }
+      if (tc.tool === 'get_resume_detail') {
+        cards.push(...parseResumeCardsFromDetailToolResult(tc.result));
+      }
+    });
 
   if (cards.length === 0) {
     cards.push(...parseResumeCardsFromContent(msg.content));
@@ -266,7 +328,7 @@ function sanitizeResumeAnswerContent(content: string) {
   return content
     .split('\n')
     .filter((line) => !/^\s*[-*]\s+\!\[.*?\]\(.*?\)\s*$/i.test(line))
-    .filter((line) => !/^\s*[-*]\s+\*?\*?photo\*?\*?:/i.test(line))
+    .filter((line) => !/^\s*[-*]?\s*\*?\*?(photo|photo url|profile|profile url)\*?\*?:/i.test(line))
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -379,9 +441,9 @@ function ResumeInlineAnswer({ content, cards }: { content: string; cards: Parsed
                 )}
               </div>
             </div>
-            {primaryCard.resumeId && (
+            {(primaryCard.profileUrl || primaryCard.resumeId) && (
               <Link
-                to={`/resumes/${primaryCard.resumeId}`}
+                to={primaryCard.profileUrl || `/resumes/${primaryCard.resumeId}`}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-violet-100 bg-violet-50 px-3 py-2 text-[10px] font-black uppercase tracking-[0.18em] text-violet-600 transition-all hover:bg-violet-600 hover:text-white shrink-0"
               >
                 Open Resume <ExternalLink className="w-3 h-3" />
@@ -471,9 +533,9 @@ function ResumeInlineAnswer({ content, cards }: { content: string; cards: Parsed
             {matchedCard.experience ? ` | ${matchedCard.experience}` : ''}
           </div>
         </div>
-        {matchedCard.resumeId && (
+        {(matchedCard.profileUrl || matchedCard.resumeId) && (
           <Link
-            to={`/resumes/${matchedCard.resumeId}`}
+            to={matchedCard.profileUrl || `/resumes/${matchedCard.resumeId}`}
             className="inline-flex items-center gap-1.5 text-[9px] text-violet-600 font-black hover:bg-violet-600 hover:text-white transition-all bg-violet-50 px-3 py-2 rounded-xl border border-violet-100 uppercase tracking-wider shadow-sm shrink-0"
           >
             Profile <ExternalLink className="w-2.5 h-2.5" />
@@ -624,12 +686,14 @@ function ChatMatchRow({ item, rank }: { item: ParsedMatchCard; rank: number }) {
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-3 mb-1">
             <h3 className="text-sm font-black text-slate-900 truncate uppercase tracking-tight">{item.candidateName}</h3>
-            <Link
-              to={`/resumes/${item.resumeId}`}
-              className="flex items-center gap-1.5 text-[10px] text-violet-600 font-bold hover:text-white hover:bg-violet-600 transition-all bg-violet-50 px-2.5 py-1 rounded-lg border border-violet-100 uppercase tracking-wider"
-            >
-              Open Resume <ExternalLink className="w-2.5 h-2.5" />
-            </Link>
+            {(item.profileUrl || item.resumeId) && (
+              <Link
+                to={item.profileUrl || `/resumes/${item.resumeId}`}
+                className="flex items-center gap-1.5 text-[10px] text-violet-600 font-bold hover:text-white hover:bg-violet-600 transition-all bg-violet-50 px-2.5 py-1 rounded-lg border border-violet-100 uppercase tracking-wider"
+              >
+                Open Resume <ExternalLink className="w-2.5 h-2.5" />
+              </Link>
+            )}
           </div>
           <p className="text-[11px] font-bold text-slate-400 mb-4 truncate italic">
             {item.roleTitle} — {item.experienceYears}

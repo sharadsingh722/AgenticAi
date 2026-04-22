@@ -412,21 +412,45 @@ def _build_tender_detail_response(tender_id: int, db: Session) -> tuple[str, lis
 
     roles = json.loads(tender.required_roles) if tender.required_roles else []
     techs = json.loads(tender.key_technologies) if tender.key_technologies else []
+    eligibility = json.loads(tender.eligibility_criteria) if tender.eligibility_criteria else []
     lines = [
         f"**TND-{tender.id:04d}** | {tender.project_name}",
         f"- Client: {tender.client or 'N/A'}",
         f"- Duration: {tender.project_duration or 'N/A'}",
         f"- Reference: {tender.document_reference or 'N/A'}",
         f"- Date: {tender.document_date or 'N/A'}",
+        f"- File: {tender.file_name}",
         f"- Technologies: {', '.join(techs) if techs else 'N/A'}",
+        f"- Eligibility Criteria Count: {len(eligibility)}",
         f"- Roles Count: {len(roles)}",
     ]
+
+    if eligibility:
+        lines.append("- Eligibility Criteria:")
+        for item in eligibility[:20]:
+            lines.append(f"  - {item}")
+
     if roles:
         lines.append("- Required Roles:")
-        for role in roles[:6]:
+        for role in roles[:20]:
+            role_title = role.get('role_title') or 'N/A'
+            min_experience = role.get('min_experience', 0)
+            required_skills = role.get('required_skills', []) or []
+            required_certs = role.get('required_certifications', []) or []
+            required_domain = role.get('required_domain', []) or []
+            preferred_components = role.get('preferred_components', []) or []
+            min_project_value_cr = role.get('min_project_value_cr', 0)
+            client_type_pref = role.get('client_type_preference')
             lines.append(
-                f"  - {role.get('role_title') or 'N/A'} | Min Experience: {role.get('min_experience', 0)} years"
+                f"  - {role_title}"
             )
+            lines.append(f"    - Min Experience: {min_experience} years")
+            lines.append(f"    - Required Skills: {', '.join(required_skills) if required_skills else 'N/A'}")
+            lines.append(f"    - Required Certifications: {', '.join(required_certs) if required_certs else 'N/A'}")
+            lines.append(f"    - Required Domain: {', '.join(required_domain) if required_domain else 'N/A'}")
+            lines.append(f"    - Preferred Components: {', '.join(preferred_components) if preferred_components else 'N/A'}")
+            lines.append(f"    - Min Project Value: {min_project_value_cr or 0} Cr")
+            lines.append(f"    - Client Type Preference: {client_type_pref or 'N/A'}")
 
     return "\n".join(lines), [{
         "tool": "live_tender_detail_lookup",
@@ -660,22 +684,6 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         tool_calls_log = []
 
         try:
-            if not is_project_scoped:
-                combined_content = _off_topic_response()
-
-                db_resp = ChatMessage(
-                    session_id=session_id,
-                    role="assistant",
-                    content=combined_content,
-                    tool_calls=None,
-                )
-                db.add(db_resp)
-                db.commit()
-
-                yield sse_event("answer", {"content": combined_content})
-                yield sse_event("done", {})
-                return
-
             if grounded_response:
                 combined_content = grounded_response
                 tool_calls_log.extend(grounded_tool_log)
